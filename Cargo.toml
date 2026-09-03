@@ -1,0 +1,31 @@
+[package]
+name = "mpv-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Toolkit-agnostic libmpv embedding core: handle lifecycle, commands, typed events, and render seams."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ophymx/mpv-engine"
+keywords = ["mpv", "libmpv", "video", "player"]
+categories = ["multimedia::video"]
+
+# Dependency policy: the default build must stay boring — libmpv bindings
+# and std-adjacent utility crates only. No toolkit deps (gtk, iced, winit),
+# no git deps (crates.io forbids them, and they'd re-couple us to exactly
+# the churn this crate exists to contain). Planned non-default features
+# (`egl`, `export`, `wgpu`) get their own entries when implemented — see
+# README "Roadmap".
+
+[dependencies]
+libc = "0.2"
+# rsmpv/rsmpv-sys are permissively licensed (MIT OR Apache-2.0 / ISC)
+# clean-room bindings; the only copyleft in a consumer's tree is libmpv
+# itself — see LICENSING.md. `render` pulls in the render.h bindings the
+# raw render seam uses.
+rsmpv = { version = "0.1", features = ["render"] }
+parking_lot = "0.12"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

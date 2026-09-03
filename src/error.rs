@@ -1,0 +1,46 @@
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum Error {
+    #[error("mpv: {0}")]
+    Mpv(#[from] rsmpv::Error),
+    /// A raw `mpv_render_*` call failed (these go through `rsmpv::sys`
+    /// directly — see `render.rs` for why). Carries the mpv error code.
+    #[error("mpv render: {}", describe_code(*.0))]
+    Render(i32),
+    /// An attach called while a render context is already live. mpv
+    /// supports exactly one render context per handle, of either backend.
+    #[error("a render context is already attached")]
+    AlreadyAttached,
+    /// A render call against the wrong attached backend (e.g. `render_gl`
+    /// while the software context is attached) — a wiring bug in the
+    /// shell, surfaced loudly rather than silently dropped.
+    #[error("render call does not match the attached render backend")]
+    RenderBackendMismatch,
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Diagnostic text for a raw `client.h` `mpv_error` code: mpv's own
+/// `mpv_error_string` text plus the numeric code (rsmpv's `Display`
+/// carries both) — not user-facing copy.
+pub(crate) fn describe_code(code: i32) -> String {
+    rsmpv::Error::from_raw(code).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describe_code_carries_mpv_text_and_code() {
+        // -17 is MPV_ERROR_UNKNOWN_FORMAT; the exact wording belongs to
+        // mpv, so pin only that its text came through alongside the code.
+        let msg = describe_code(-17);
+        assert!(msg.contains("format"), "unexpected message: {msg}");
+        assert!(msg.contains("-17"), "unexpected message: {msg}");
+        // Unknown codes still produce a code-bearing string.
+        assert!(describe_code(-99).contains("-99"));
+    }
+}
