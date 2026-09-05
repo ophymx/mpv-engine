@@ -25,6 +25,19 @@ fn headless_engine() -> Option<Engine> {
     }
 }
 
+/// A render-API (`vo=libmpv`) engine, or None when mpv is unavailable.
+/// Audio is nulled for the same reason as in [`headless_engine`]: mpv's
+/// AO probe hard-aborts the process on a box with no sound server.
+fn video_engine() -> Option<Engine> {
+    match Engine::video().property("ao", "null").build() {
+        Ok(e) => Some(e),
+        Err(e) => {
+            eprintln!("skipping: mpv engine unavailable: {e}");
+            None
+        }
+    }
+}
+
 /// 1 second of silence in an ogg container, or None when ffmpeg is absent.
 fn generate_audio(target: &Path) -> Option<()> {
     let status = std::process::Command::new("ffmpeg")
@@ -292,6 +305,79 @@ fn pause_before_attach_loads_deferred_file_paused() {
     assert!(
         engine.is_paused(),
         "pause set before attach must hold through the deferred load"
+    );
+}
+
+/// The defer-or-load decision reads the *current* `vo`, not a build-time
+/// snapshot: a render-API engine switched to `vo=null` at runtime (an
+/// audio-only mode) gets a plain playing load — not a source parked in
+/// the queue waiting for an attach that will never come.
+#[test]
+fn load_when_ready_follows_runtime_vo_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("test.nut");
+    if generate_video(&source).is_none() {
+        return;
+    }
+    let Some(engine) = video_engine() else {
+        return;
+    };
+    engine.set_property("vo", "null").unwrap();
+    engine.load_when_ready(source.to_str().unwrap()).unwrap();
+    assert!(
+        pump_until(&engine, |ev| matches!(ev, PlaybackEvent::Loaded)),
+        "with vo switched off the render API, the load must not defer"
+    );
+    assert!(!engine.is_paused(), "playback must start immediately");
+}
+
+/// Transport commands issued through the `command` escape hatch obey the
+/// same "newest call decides what plays" rule as the typed methods: a
+/// `stop` between `load_when_ready` and the attach discards the queued
+/// source — the attach must not resurrect it.
+#[test]
+fn command_stop_discards_deferred_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("test.nut");
+    if generate_video(&source).is_none() {
+        return;
+    }
+    let Some(engine) = video_engine() else {
+        return;
+    };
+    engine.load_when_ready(source.to_str().unwrap()).unwrap();
+    engine.command("stop", &[]).unwrap();
+    engine.attach_sw_render(|| {}).unwrap();
+    // Enough pumping to catch a wrongly issued load (Loaded lands well
+    // within this window in the tests above).
+    for _ in 0..10 {
+        for ev in engine.pump_events() {
+            assert!(
+                !matches!(ev, PlaybackEvent::Loaded),
+                "stop before attach must discard the deferred load"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(engine.is_idle(), "nothing may be loaded after the stop");
+}
+
+/// An attach `Err` means "no context was attached" — nothing else. A
+/// deferred source that cannot play must not fail the attach: the
+/// context goes live, and the failure arrives as a `Failed` event.
+#[test]
+fn attach_survives_failing_deferred_load() {
+    let Some(engine) = video_engine() else {
+        return;
+    };
+    engine.load_when_ready("/nonexistent/deferred.nut").unwrap();
+    engine
+        .attach_sw_render(|| {})
+        .expect("a failing deferred load must not fail the attach");
+    assert!(engine.has_render(), "the render context must be live");
+    assert!(
+        pump_until(&engine, |ev| matches!(ev, PlaybackEvent::Failed { .. })),
+        "the deferred load's failure must surface as a Failed event"
     );
 }
 

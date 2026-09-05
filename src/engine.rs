@@ -239,25 +239,14 @@ impl EngineBuilder {
         for (name, value) in &self.props {
             builder = builder.set_property(name, value.as_str())?;
         }
-        // An engine renders through the render API iff its effective `vo`
-        // includes `libmpv` — the last `vo` set wins (call order applies),
-        // and `vo` accepts a comma-separated fallback chain. This is what
-        // lets `load_when_ready` degrade to a plain `load` on engines
-        // (headless, windowed vo) where no attach is ever coming.
-        let expects_render = self
-            .props
-            .iter()
-            .rev()
-            .find(|(name, _)| name == "vo")
-            .is_some_and(|(_, v)| v.split(',').any(|part| part.trim() == "libmpv"));
         let mpv = Arc::new(builder.build()?);
         Ok(Engine {
             render: Mutex::new(None),
             attach: Mutex::new(()),
             pump: Mutex::new(()),
             next_observe_id: AtomicU64::new(1),
-            expects_render,
             pending_load: Mutex::new(None),
+            deferred_events: Mutex::new(Vec::new()),
             mpv,
         })
     }
@@ -291,17 +280,25 @@ pub struct Engine {
     /// Userdata ids handed to `mpv_observe_property`; each observation
     /// gets a fresh one so [`unobserve`](Engine::unobserve) is precise.
     next_observe_id: AtomicU64,
-    /// Whether this engine's `vo` routes frames through the render API
-    /// (`libmpv`), fixed at build. Drives
-    /// [`load_when_ready`](Engine::load_when_ready): engines that never
-    /// attach get plain loads instead of a deferred load that would wait
-    /// forever.
-    expects_render: bool,
     /// Source queued by [`load_when_ready`](Engine::load_when_ready)
     /// until a render context attaches; the attach methods take it and
-    /// issue the `loadfile`. Cleared by `load`/`load_paused`/`stop` —
-    /// the newest transport call decides what plays.
+    /// issue the `loadfile`. Cleared by any transport call that decides
+    /// what plays — `load`/`load_paused`/`stop`, or their spellings
+    /// through [`command`](Engine::command) — the newest one wins.
+    ///
+    /// Doubles as the transport-ordering lock: every such call mutates
+    /// the slot and issues its mpv command *under this guard*, so
+    /// "newest wins" is real under concurrency — a drain can't interleave
+    /// with a `stop` between taking the slot and the `loadfile` landing.
+    /// Leaf lock: nothing acquired while it is held (mpv commands take no
+    /// engine locks; wakeup callbacks are documented to call no engine
+    /// methods).
     pending_load: Mutex<Option<String>>,
+    /// Engine-synthesized events prepended by
+    /// [`pump_events`](Engine::pump_events) — currently only a `Failed`
+    /// when a deferred load errors at attach time, so the attach methods'
+    /// `Err` can keep meaning "no context was attached".
+    deferred_events: Mutex<Vec<PlaybackEvent>>,
     /// Shared with any live render context, which holds its own clone.
     mpv: Arc<Mpv>,
 }
@@ -349,8 +346,17 @@ impl Engine {
     /// context exists leaves mpv with nowhere to send frames (audio plays,
     /// video stays black), and demuxing before the window shows wastes work.
     pub fn load(&self, source: &str) -> Result<()> {
-        // A plain load supersedes any pending deferred load.
-        *self.pending_load.lock() = None;
+        // A plain load supersedes any pending deferred load; the guard is
+        // held across the command so the two are one transport step.
+        let mut pending = self.pending_load.lock();
+        *pending = None;
+        self.loadfile(source)
+    }
+
+    /// Issue the raw `loadfile` command, touching no engine state. The
+    /// callers own the [`pending_load`](Self::pending_load) transport
+    /// step around this.
+    fn loadfile(&self, source: &str) -> Result<()> {
         // rsmpv passes args as an array (`mpv_command`), so paths with
         // spaces/quotes need no escaping here. Do not "simplify" this
         // into a formatted command string — that reintroduces the quoting
@@ -391,18 +397,24 @@ impl Engine {
     /// The queued source is a *pending intent*: a later
     /// [`load`](Self::load), [`load_paused`](Self::load_paused), or
     /// [`stop`](Self::stop) before the attach supersedes it (newest
-    /// transport call wins), and a second `load_when_ready` replaces it.
-    /// Pause
+    /// transport call wins — including the same commands issued through
+    /// [`command`](Self::command)), and a second `load_when_ready`
+    /// replaces it. Pause
     /// state needs no special casing — the `pause` property persists
     /// across `loadfile`, so a consumer that pauses before the attach
     /// gets the deferred file loaded paused, exactly as if it had been
     /// playing.
     ///
-    /// An `Err` from an attach call can therefore also be the deferred
-    /// `loadfile` failing; the render context is attached by then either
-    /// way.
+    /// The defer-or-load decision reads the **current** `vo` property,
+    /// so it tracks runtime `vo` changes (via
+    /// [`set_property`](Self::set_property)) and values picked up from a
+    /// config file — not just what the builder set. A deferred `loadfile`
+    /// that fails at attach time surfaces as
+    /// [`PlaybackEvent::Failed`] on the next
+    /// [`pump_events`](Self::pump_events), never as an `Err` from the
+    /// attach call.
     pub fn load_when_ready(&self, source: &str) -> Result<()> {
-        if !self.expects_render || self.has_render() {
+        if !self.expects_render() || self.has_render() {
             return self.load(source);
         }
         *self.pending_load.lock() = Some(source.to_owned());
@@ -416,12 +428,42 @@ impl Engine {
         Ok(())
     }
 
+    /// Whether frames route through the render API right now: the
+    /// current `vo` property includes `libmpv` (it accepts a
+    /// comma-separated fallback chain). Read live rather than snapshotted
+    /// at build — `vo` is runtime-settable through this crate's own
+    /// [`set_property`](Self::set_property), and a config file can set it
+    /// behind the builder's back. On a read failure, err toward a plain
+    /// load: the `loadfile` then surfaces the real error instead of the
+    /// source silently parking in the queue.
+    fn expects_render(&self) -> bool {
+        self.get_property::<String>("vo")
+            .is_ok_and(|vo| vo.split(',').any(|part| part.trim() == "libmpv"))
+    }
+
     /// Escape hatch: any mpv command, args passed as an array (no quoting
     /// needed).
+    ///
+    /// Commands that decide what plays next — `loadfile`, `loadlist`,
+    /// `stop`, `quit`, `quit-watch-later` — also discard a load queued by
+    /// [`load_when_ready`](Self::load_when_ready), same as the typed
+    /// transport methods: this is the only way to issue `loadfile` with
+    /// flags, and a superseded source must not resurface at attach time.
     pub fn command(&self, name: &str, args: &[&str]) -> Result<()> {
         let mut argv = Vec::with_capacity(args.len() + 1);
         argv.push(name);
         argv.extend_from_slice(args);
+        let supersedes_pending = matches!(
+            name,
+            "loadfile" | "loadlist" | "stop" | "quit" | "quit-watch-later"
+        );
+        // Transport commands run under the pending_load guard (clear +
+        // command as one step); everything else goes straight through.
+        let _transport = supersedes_pending.then(|| {
+            let mut pending = self.pending_load.lock();
+            *pending = None;
+            pending
+        });
         self.mpv.command(&argv)?;
         Ok(())
     }
@@ -468,7 +510,7 @@ impl Engine {
     /// load queued by [`load_when_ready`](Self::load_when_ready) — there
     /// is nothing left to play.
     pub fn stop(&self) -> Result<()> {
-        *self.pending_load.lock() = None;
+        // `command` clears the pending deferred load (transport command).
         self.command("stop", &[])
     }
 
@@ -585,7 +627,9 @@ impl Engine {
     /// ordered sequences across callers' batches.
     pub fn pump_events(&self) -> Vec<PlaybackEvent> {
         let _guard = self.pump.lock();
-        let mut out = Vec::new();
+        // Engine-synthesized events first (a deferred load that failed at
+        // attach time) — they predate whatever mpv has queued now.
+        let mut out = std::mem::take(&mut *self.deferred_events.lock());
         while let Some(ev) = self.mpv.poll_event() {
             match ev {
                 Event::Shutdown => out.push(PlaybackEvent::Shutdown),
@@ -662,6 +706,13 @@ impl Engine {
     /// structure, *then* attach with the weak-capturing closure, then
     /// load.
     ///
+    /// A successful attach also issues any load queued by
+    /// [`load_when_ready`](Self::load_when_ready). `Err` still means "no
+    /// context was attached" — a deferred `loadfile` that fails here
+    /// leaves the context in place and surfaces as
+    /// [`PlaybackEvent::Failed`] on the next
+    /// [`pump_events`](Self::pump_events) (the wakeup callback fires).
+    ///
     /// `options` fixes the shell's render-loop discipline at attach:
     /// frame pacing ([`GlRenderOptions::block_for_target_time`]) and
     /// mpv's advanced control ([`GlRenderOptions::advanced_control`],
@@ -700,7 +751,8 @@ impl Engine {
             unsafe { GlRender::create(self.mpv.clone(), get_proc_address, options, on_update)? };
         *self.render.lock() = Some(RenderBackend::Gl(render));
         tracing::debug!("mpv GL render context attached");
-        self.load_pending()
+        self.drain_pending_load();
+        Ok(())
     }
 
     /// Create the software render context: frames arrive as RGBA bytes
@@ -714,6 +766,12 @@ impl Engine {
     /// render thread plus once synchronously (outside the render lock,
     /// before the context is stored), and typically captures a `Weak`
     /// handle — construct, share, attach, then load.
+    ///
+    /// As with [`attach_gl_render`](Self::attach_gl_render): a successful
+    /// attach issues any [`load_when_ready`](Self::load_when_ready)
+    /// queue, `Err` still means "no context was attached", and a deferred
+    /// `loadfile` failing here surfaces as [`PlaybackEvent::Failed`] on
+    /// the next [`pump_events`](Self::pump_events) instead.
     pub fn attach_sw_render(&self, on_update: impl Fn() + Send + Sync + 'static) -> Result<()> {
         // Same locking shape as `attach_gl_render`, for the same reasons.
         let _attaching = self.attach.lock();
@@ -723,20 +781,43 @@ impl Engine {
         let render = SwRender::create(self.mpv.clone(), on_update)?;
         *self.render.lock() = Some(RenderBackend::Sw(render));
         tracing::debug!("mpv software render context attached");
-        self.load_pending()
+        self.drain_pending_load();
+        Ok(())
     }
 
     /// Issue the `loadfile` a [`load_when_ready`](Self::load_when_ready)
-    /// queued, now that a render context is stored. An `Err` here leaves
-    /// the freshly attached context in place; only the deferred load
-    /// failed. (The guard is dropped before loading — `load` takes no
-    /// locks, but holding one across an mpv command invites deadlocks.)
+    /// queued, now that a render context is stored. The guard is held
+    /// across the `loadfile` — take-then-load must be one transport step,
+    /// or a concurrent `stop`/`load` landing in between would be
+    /// overridden by the older, superseded source.
     fn load_pending(&self) -> Result<()> {
-        let pending = self.pending_load.lock().take();
-        match pending {
-            Some(source) => self.load(&source),
+        let mut pending = self.pending_load.lock();
+        match pending.take() {
+            Some(source) => self.loadfile(&source),
             None => Ok(()),
         }
+    }
+
+    /// [`load_pending`](Self::load_pending) for the attach paths, where
+    /// an `Err` must keep meaning "no context was attached": the freshly
+    /// stored context stays either way, so a deferred-load failure is
+    /// rerouted onto the event stream as [`PlaybackEvent::Failed`] — the
+    /// channel an asynchronous load failure was headed for anyway — and
+    /// the wakeup callback is tickled so push-driven shells pump for it.
+    fn drain_pending_load(&self) {
+        let Err(err) = self.load_pending() else {
+            return;
+        };
+        tracing::warn!("deferred load failed at attach: {err}");
+        let code = match &err {
+            Error::Mpv(e) => e.raw_code().unwrap_or(sys::MPV_ERROR_GENERIC),
+            _ => sys::MPV_ERROR_GENERIC,
+        };
+        self.deferred_events.lock().push(PlaybackEvent::Failed {
+            code,
+            message: describe_code(code),
+        });
+        self.mpv.wakeup();
     }
 
     /// Drop the render context *now*. For the OpenGL backend, call with
