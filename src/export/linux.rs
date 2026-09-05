@@ -208,28 +208,23 @@ macro_rules! load_fn {
     }};
 }
 
-/// Open the first usable DRM render node (`/dev/dri/renderD128`…) —
-/// render nodes need no display server, no DRM master, and no seat,
-/// which is what keeps this backend usable from any session that can
-/// see the GPU at all.
-fn open_render_node() -> Result<OwnedFd> {
-    for minor in 128..192 {
-        let path = format!("/dev/dri/renderD{minor}\0");
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr().cast::<c_char>(),
-                libc::O_RDWR | libc::O_CLOEXEC,
-            )
-        };
-        if fd >= 0 {
-            // SAFETY: freshly opened, owned here.
-            return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
-        }
+/// Open one DRM render node (`/dev/dri/renderD<minor>`) — render nodes
+/// need no display server, no DRM master, and no seat, which is what
+/// keeps this backend usable from any session that can see the GPU at
+/// all.
+fn open_node(minor: u32) -> Option<OwnedFd> {
+    let path = format!("/dev/dri/renderD{minor}\0");
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr().cast::<c_char>(),
+            libc::O_RDWR | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
     }
-    Err(Error::ExportSetup(
-        "no DRM render node under /dev/dri (no GPU, or no permission — user not in the render/video group?)"
-            .into(),
-    ))
+    // SAFETY: freshly opened, owned here.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// RAII half-built pieces so `GlContext::new`'s error paths unwind
@@ -325,8 +320,39 @@ pub(crate) struct GlContext {
 }
 
 impl GlContext {
+    /// Bring the backend up on the first *usable* render node — a node
+    /// that opens is not enough on hybrid-GPU boxes, where e.g.
+    /// `renderD128` may lack EGL-on-GBM/dma-buf support while
+    /// `renderD129` is fully capable, so every setup failure falls
+    /// through to the next node (the wlroots/Mesa device-selection
+    /// discipline) rather than failing the attach.
     pub(crate) fn new() -> Result<Self> {
-        let drm = open_render_node()?;
+        let mut last_error = None;
+        for minor in 128..192 {
+            let Some(drm) = open_node(minor) else {
+                continue;
+            };
+            match Self::on_node(drm) {
+                Ok(gl) => return Ok(gl),
+                Err(e) => {
+                    tracing::debug!("export: render node renderD{minor} unusable: {e}");
+                    last_error = Some(e);
+                }
+            }
+        }
+        Err(match last_error {
+            Some(Error::ExportSetup(msg)) => {
+                Error::ExportSetup(format!("no usable DRM render node (last tried: {msg})"))
+            }
+            Some(e) => e,
+            None => Error::ExportSetup(
+                "no DRM render node under /dev/dri (no GPU, or no permission — user not in the render/video group?)"
+                    .into(),
+            ),
+        })
+    }
+
+    fn on_node(drm: OwnedFd) -> Result<Self> {
         let gbm = unsafe { gbm_create_device(drm.as_raw_fd()) };
         if gbm.is_null() {
             return Err(Error::ExportSetup(

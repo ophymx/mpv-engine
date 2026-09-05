@@ -30,10 +30,10 @@ use linux as platform;
 mod macos;
 #[cfg(target_os = "macos")]
 use macos as platform;
-#[cfg(all(feature = "wgpu", target_os = "macos"))]
-mod wgpu_macos;
 #[cfg(all(feature = "wgpu", target_os = "linux"))]
 mod wgpu_linux;
+#[cfg(all(feature = "wgpu", target_os = "macos"))]
+mod wgpu_macos;
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -111,6 +111,13 @@ pub(crate) struct ExportShared {
     force_render: AtomicBool,
     /// A frame was `presented()`; forward `report_swap` to mpv.
     swap_pending: AtomicBool,
+    /// A wanted render was dropped because no pool buffer was available
+    /// (shell holding all of them, or allocation failed). Checked when a
+    /// buffer comes back ([`return_buffer`] / [`retire_buffer`]), which
+    /// re-arms `force_render` — so a `set_export_size` landing during
+    /// pool exhaustion still re-renders once a buffer frees up, instead
+    /// of leaving a paused/ended video stale at the old size forever.
+    render_dropped: AtomicBool,
     /// Current target size, `(w << 32) | h`. Applied from the next
     /// rendered frame; stale-size pool buffers are retired lazily.
     target_size: AtomicU64,
@@ -151,6 +158,22 @@ impl ExportShared {
         self.force_render.store(true, Ordering::SeqCst);
         self.notify();
     }
+
+    /// A published frame is waiting to be acquired. Used by attach to
+    /// re-fire `on_update` for a frame published before the backend
+    /// landed in the engine's render slot.
+    pub(crate) fn has_published(&self) -> bool {
+        self.state.lock().published.is_some()
+    }
+
+    /// A buffer became available again: if a wanted render was dropped
+    /// for lack of one, re-arm the forced render now.
+    fn rearm_dropped_render(&self) {
+        if self.render_dropped.swap(false, Ordering::SeqCst) {
+            self.force_render.store(true, Ordering::SeqCst);
+            self.notify();
+        }
+    }
 }
 
 /// The engine-side handle stored in the render slot: shared state plus
@@ -179,6 +202,7 @@ impl ExportedRender {
             update_pending: AtomicBool::new(false),
             force_render: AtomicBool::new(false),
             swap_pending: AtomicBool::new(false),
+            render_dropped: AtomicBool::new(false),
             target_size: AtomicU64::new(pack_size(options.width, options.height)),
             pool_size: options.pool_size.max(2),
         });
@@ -207,6 +231,17 @@ impl ExportedRender {
     pub(crate) fn shared(&self) -> &Arc<ExportShared> {
         &self.shared
     }
+
+    /// Whether the calling thread *is* this backend's render thread —
+    /// i.e. we are inside `on_update` (or code it called). Drives the
+    /// two teardown paths below and
+    /// [`Engine::detach_render`](crate::Engine::detach_render)'s lock
+    /// choice.
+    pub(crate) fn is_render_thread(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(|t| t.thread().id() == std::thread::current().id())
+    }
 }
 
 impl Drop for ExportedRender {
@@ -214,6 +249,17 @@ impl Drop for ExportedRender {
         self.shared.shutdown.store(true, Ordering::SeqCst);
         self.shared.notify();
         if let Some(thread) = self.thread.take() {
+            if thread.thread().id() == std::thread::current().id() {
+                // Dropped from inside the render thread's own callback (a
+                // shell detaching — or dropping its last Engine — from
+                // `on_update`): joining would self-deadlock (EDEADLK, a
+                // panic inside Drop). Detach the handle instead; the
+                // shutdown flag is already set, so the thread runs its
+                // normal teardown and exits as soon as the callback
+                // returns. The GL context is freed on the thread it is
+                // current on either way.
+                return;
+            }
             let _ = thread.join();
         }
     }
@@ -375,6 +421,7 @@ fn render_one(
                     }
                     Err(e) => {
                         tracing::warn!("export: buffer allocation failed: {e}");
+                        shared.render_dropped.store(true, Ordering::SeqCst);
                         None
                     }
                 }
@@ -383,6 +430,10 @@ fn render_one(
                     "export: shell holds all {} buffers; dropping frame",
                     shared.pool_size
                 );
+                // The consumed update/force flags would otherwise lose
+                // this render for good on a paused/ended video; a buffer
+                // return re-arms it (see `render_dropped`).
+                shared.render_dropped.store(true, Ordering::SeqCst);
                 None
             }
         }
@@ -553,9 +604,12 @@ impl Drop for ExportedFrame {
 /// shared state drops with it (GL names died with the context; the
 /// backing memory is released by `SurfaceBuffer`'s own drop).
 fn return_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
-    let mut state = shared.state.lock();
-    state.in_use -= 1;
-    state.free.push(buffer);
+    {
+        let mut state = shared.state.lock();
+        state.in_use -= 1;
+        state.free.push(buffer);
+    }
+    shared.rearm_dropped_render();
 }
 
 /// Permanently retire an in-use buffer from the pool — the Linux wgpu
@@ -575,6 +629,10 @@ fn retire_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
         state.live -= 1;
         state.retired.push(buffer);
     }
+    // `live` shrank, so capacity exists again — a dropped render can
+    // re-run into a fresh allocation. The notify inside doubles as the
+    // retired-queue wake.
+    shared.rearm_dropped_render();
     shared.notify();
 }
 

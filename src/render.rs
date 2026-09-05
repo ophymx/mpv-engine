@@ -107,11 +107,12 @@ pub enum RenderKind {
     /// The software backend
     /// ([`Engine::attach_sw_render`](crate::Engine::attach_sw_render)).
     Software,
-    /// The exported-frame backend (`export` feature, macOS —
+    /// The exported-frame backend (`export` feature, macOS + Linux —
     /// `Engine::attach_exported_render`): the engine renders on its own
-    /// hidden GL context and hands the shell zero-copy IOSurface frames.
-    /// The variant exists on every platform so cross-platform shells can
-    /// match on it unconditionally; only the feature produces it.
+    /// hidden GL context and hands the shell zero-copy exportable frames
+    /// (IOSurface-backed / DMA-BUF-backed). The variant exists on every
+    /// platform so cross-platform shells can match on it
+    /// unconditionally; only the feature produces it.
     Exported,
 }
 
@@ -145,6 +146,19 @@ impl RenderBackend {
             RenderBackend::Sw(_) => RenderKind::Software,
             #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
             RenderBackend::Exported(_) => RenderKind::Exported,
+        }
+    }
+
+    /// Whether the calling thread is this backend's own render thread —
+    /// true only for the exported backend when called from inside its
+    /// `on_update`. Decides `detach_render`'s locking (see there): a
+    /// self-detach must not block on the attach lock, which a concurrent
+    /// detach may hold while joining this very thread.
+    pub(crate) fn on_own_render_thread(&self) -> bool {
+        match self {
+            #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+            RenderBackend::Exported(r) => r.is_render_thread(),
+            _ => false,
         }
     }
 }

@@ -883,19 +883,71 @@ impl Engine {
     /// defer-or-load decision reads the live `vo`, so loads then run
     /// immediately instead of parking.
     pub fn detach_render(&self) {
-        // Take under the render lock, drop with it released: the exported
-        // backend's drop joins its render thread, and an in-flight
-        // frame-published callback calling `acquire_frame` (which takes
-        // the render lock) would deadlock against a join performed under
-        // it. (The guard is a temporary of the `let`, so it is released
-        // before the drop below.)
-        let taken = self.render.lock().take();
+        // Locking here answers three hazards at once:
+        //
+        // * The take + callback-slot reset happen inside one render-lock
+        //   scope, so a racing attach — which re-checks the slot under
+        //   the render lock before registering its `on_update` — orders
+        //   its registration strictly after our reset. (Resetting after
+        //   the take, unordered, could clobber a concurrently-completed
+        //   attach's fresh callback: a silent permanent freeze.)
+        // * Off the render thread (the normal case), the attach lock is
+        //   held across take/reset/drop, so an attach can't call
+        //   `mpv_render_context_create` while the old context is still
+        //   being freed — libmpv allows one render context per core, and
+        //   that race read as a spurious attach failure.
+        // * The backend itself still drops with the render lock
+        //   released: the exported backend's drop joins its render
+        //   thread, and an in-flight frame-published callback calling
+        //   `acquire_frame` (render lock) would deadlock against a join
+        //   performed under it.
+        //
+        // The exception is a detach from the exported backend's *own*
+        // render thread (a shell tearing down from `on_update`): taking
+        // the attach lock there can deadlock against a concurrent detach
+        // that holds it while joining this very thread — so the self
+        // path skips the attach lock (its take/reset ordering still
+        // holds via the render lock), and `ExportedRender`'s drop skips
+        // the self-join, deferring thread exit to just after the
+        // callback returns. An attach racing *that* narrow teardown
+        // window can still fail loudly; see `attach_exported_render`.
+        let on_render_thread = {
+            let slot = self.render.lock();
+            match slot.as_ref() {
+                // Nothing attached: done. Returning without touching the
+                // attach lock also lets a callback-detach racing a
+                // concurrent detach (which already took the backend and
+                // now joins this thread under the attach lock) unwind
+                // instead of deadlocking.
+                None => return,
+                Some(backend) => backend.on_own_render_thread(),
+            }
+        };
+        let _attaching = if on_render_thread {
+            None
+        } else {
+            Some(self.attach.lock())
+        };
+        let (taken, displaced) = {
+            let mut slot = self.render.lock();
+            let taken = slot.take();
+            // Swap the shell's callback out with the context: nothing
+            // can fire it anymore, and keeping it would pin its captures
+            // (typically shell window state) until the next attach. Only
+            // the *swap* happens under the render lock (ordering, per
+            // above); the displaced closure drops below, outside it —
+            // its captures' `Drop` may call back into the engine.
+            let displaced = taken.as_ref().map(|_| {
+                std::mem::replace(
+                    &mut *self.render_update_cb.lock(),
+                    Arc::new(|| {}) as UpdateCallback,
+                )
+            });
+            (taken, displaced)
+        };
+        drop(displaced);
         if taken.is_some() {
             drop(taken);
-            // Release the shell's callback with the context: nothing can
-            // fire it anymore, and keeping it would pin its captures
-            // (typically shell window state) until the next attach.
-            self.set_update_slot(Arc::new(|| {}));
             tracing::debug!("mpv render context detached");
         }
     }
@@ -1045,10 +1097,24 @@ impl Engine {
     /// **after a frame is published**, from the engine's own render
     /// thread (plus the usual synchronous fire when
     /// [`set_render_update_callback`](Self::set_render_update_callback)
-    /// replaces it). Calling [`acquire_frame`](Self::acquire_frame)
+    /// replaces it, and once from inside a successful attach when a
+    /// frame was already published while the attach was completing — so
+    /// a poke is never lost to that window). Calling
+    /// [`acquire_frame`](Self::acquire_frame)
     /// inside it is fine; just don't block in it — it stalls video
     /// pacing. Frames published before the shell drains them are
     /// replaced, newest wins.
+    ///
+    /// Tearing down from inside `on_update` —
+    /// [`detach_render`](Self::detach_render), or dropping the last
+    /// engine handle — is supported: the render thread's teardown is
+    /// deferred to just after the callback returns instead of joined
+    /// (which would self-deadlock). Two limits apply there: a re-attach
+    /// racing that brief teardown window can fail loudly
+    /// ([`Error::ExportSetup`], retryable), and **attach calls must not
+    /// be made from inside `on_update`** (nor from callback captures'
+    /// `Drop`) — a concurrent detach may hold the attach serialization
+    /// lock while waiting on this very thread.
     ///
     /// Shares the single render slot with the other backends
     /// ([`Error::AlreadyAttached`]); [`detach_render`](Self::detach_render)
@@ -1068,7 +1134,7 @@ impl Engine {
         on_update: impl Fn() + Send + Sync + 'static,
     ) -> Result<()> {
         // Same locking shape as `attach_gl_render`, for the same reasons.
-        let _attaching = self.attach.lock();
+        let attaching = self.attach.lock();
         if self.render.lock().is_some() {
             return Err(Error::AlreadyAttached);
         }
@@ -1081,9 +1147,19 @@ impl Engine {
                 return Err(e);
             }
         };
+        let shared = Arc::clone(render.shared());
         *self.render.lock() = Some(RenderBackend::Exported(render));
         tracing::debug!("mpv exported render context attached");
         self.drain_pending_load();
+        drop(attaching);
+        // A frame published between the render thread coming up and the
+        // backend landing in the slot fired `on_update` into a window
+        // where `acquire_frame` still read an empty slot. Re-fire once
+        // now that the frame is acquirable — after every engine lock is
+        // released, per the callback contract.
+        if shared.has_published() {
+            (self.update_relay())();
+        }
         Ok(())
     }
 
@@ -1110,7 +1186,10 @@ impl Engine {
     /// Resize the exported backend's frames: takes effect from the next
     /// rendered frame (which is forced promptly, so a paused or ended
     /// video re-renders at the new size instead of waiting for playback
-    /// to produce one). Zero in either dimension pauses rendering until a
+    /// to produce one — and if the shell happens to be holding every
+    /// pool buffer at that moment, the forced render re-arms as soon as
+    /// a frame handle is released, rather than being lost). Zero in
+    /// either dimension pauses rendering until a
     /// real size arrives — map-before-layout states in a shell.
     /// No-op `Ok` when nothing is attached;
     /// [`Error::RenderBackendMismatch`] for a different backend.
