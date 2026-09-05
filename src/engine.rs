@@ -5,7 +5,9 @@ use parking_lot::Mutex;
 use rsmpv::{EndFileReason, Event, Format, Mpv, PropertyData, sys};
 
 use crate::error::{Error, Result, describe_code};
-use crate::render::{GlRender, GlRenderOptions, ProcAddressFn, RenderBackend, RenderKind, SwRender};
+use crate::render::{
+    GlRender, GlRenderOptions, ProcAddressFn, RenderBackend, RenderKind, SwRender,
+};
 
 /// Force `LC_NUMERIC=C` exactly once before the first `mpv_create`. mpv
 /// refuses to work under a comma-decimal locale (its option/number parsing

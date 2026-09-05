@@ -654,8 +654,7 @@ fn render_update_callback_replaces_attach_registration() {
 
     engine.load(source.to_str().unwrap()).unwrap();
     let before_frames = replacement_fires.load(Ordering::SeqCst);
-    let frames_signaled =
-        wait_until(|| replacement_fires.load(Ordering::SeqCst) > before_frames);
+    let frames_signaled = wait_until(|| replacement_fires.load(Ordering::SeqCst) > before_frames);
     assert!(
         frames_signaled,
         "frame updates must land on the replacement callback"
