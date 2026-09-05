@@ -26,6 +26,14 @@ pub enum Error {
     #[cfg(all(feature = "export", target_os = "macos"))]
     #[error("exported render setup: {0}")]
     ExportSetup(String),
+    /// Importing an exported frame into a wgpu device failed (`wgpu`
+    /// feature,
+    /// [`ExportedFrame::into_wgpu_texture`](crate::ExportedFrame::into_wgpu_texture))
+    /// — the device isn't on the platform's native backend (Metal on
+    /// macOS), or the driver refused the IOSurface wrap.
+    #[cfg(all(feature = "wgpu", target_os = "macos"))]
+    #[error("wgpu import: {0}")]
+    WgpuImport(String),
     /// A call that needs a live render context ran before any attach.
     /// Today only
     /// [`Engine::set_render_update_callback`](crate::Engine::set_render_update_callback)

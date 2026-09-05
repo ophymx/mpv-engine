@@ -80,7 +80,14 @@ Owned here today:
   to libmpv's GL-or-software render API, with no GL and no pixel copies
   in the shell. Fully safe API (the GL-currency contract never crosses
   it), newest-wins frame pool, live resizing (`set_export_size`), and
-  BGRA8 row-0-at-top output pinned by an orientation test.
+  BGRA8 row-0-at-top output pinned by an orientation test. The `wgpu`
+  feature (implies `export`) adds `ExportedFrame::into_wgpu_texture`:
+  the frame wrapped as a `wgpu::Texture` on the shell's device
+  (Metal backend), with the pool buffer returned only when wgpu's own
+  GPU-completion tracking releases the texture — no manual
+  hold-until-completion discipline. Verified by tests that read the
+  texture back through wgpu and compare byte-for-byte with the
+  IOSurface.
 - An event wakeup seam (`set_wakeup_callback`) so shells get a push
   signal when events queue instead of polling `pump_events` on a timer —
   the only timely path for audio-only use or failures while paused.
@@ -132,7 +139,7 @@ The macOS half of the export story has shipped as the `export` feature
 |---|---|---|
 | `egl` | side EGL context + FBO render + RGBA readback (GL-accelerated; the pure-software path is already in core as `render_sw`) | none — stable APIs |
 | `export` (Linux) | `ExportedFrame`: OPAQUE_FD/DMA-BUF + GL semaphore export (ash only) | the *permanent* workarounds — e.g. wgpu-hal never enables `VK_KHR_external_semaphore_fd`, so the strict-loader `vkGetSemaphoreFdKHR` path lives here indefinitely |
-| `wgpu` | import `ExportedFrame` → `wgpu::Texture` via wgpu-hal | wgpu-major lockstep, isolated behind a non-default feature; releases track wgpu majors (the `egui-wgpu` pattern). When iced reaches wgpu 30, `add_wait_semaphore` replaces the empty-submit semaphore hack and `create_texture_from_hal`'s `initial_state` lands — internals change, the feature's API doesn't |
+| `wgpu` (Linux half) | import `ExportedFrame` → `wgpu::Texture` via wgpu-hal Vulkan — the feature itself has shipped (macOS/Metal path, wgpu 30) and the Vulkan import slots in under the same API | wgpu-major lockstep, isolated behind the non-default feature; releases track wgpu majors (the `egui-wgpu` pattern). On wgpu 30, `create_texture_from_hal`'s `initial_state` and `add_wait_semaphore` replace the older Vulkan-side hacks — internals change, the feature's API doesn't |
 
 The default feature set never grows unstable dependencies: a consumer on
 core + `egl` alone is structurally isolated from all of it.

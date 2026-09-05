@@ -20,6 +20,8 @@
 //! While the shell holds every buffer, frames are dropped, not queued.
 
 mod macos;
+#[cfg(feature = "wgpu")]
+mod wgpu;
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -383,6 +385,10 @@ fn render_one(ctx: &mut OwnedRenderContext, shared: &Arc<ExportShared>, relay: &
 /// encoded. Creating a Metal texture from the surface retains the
 /// surface itself, but retention only keeps the memory alive; it does
 /// not stop the pool reusing it for pixels.
+///
+/// With the `wgpu` feature, `into_wgpu_texture` removes that whole
+/// obligation: the buffer is returned to the pool only when wgpu has
+/// finished with the imported texture, GPU work included.
 pub struct ExportedFrame {
     buffer: Option<SurfaceBuffer>,
     shared: Arc<ExportShared>,
@@ -445,16 +451,24 @@ impl ExportedFrame {
 
 impl Drop for ExportedFrame {
     fn drop(&mut self) {
-        let Some(buffer) = self.buffer.take() else {
-            return;
-        };
-        let mut state = self.shared.state.lock();
-        state.in_use -= 1;
-        // Returned after teardown, the buffer just idles here until the
-        // shared state drops with it (GL names died with the context;
-        // the surface is released by SurfaceBuffer::drop).
-        state.free.push(buffer);
+        // `buffer` is `None` when ownership moved on — into the wgpu
+        // drop callback (`into_wgpu_texture`), which does this return
+        // itself once wgpu is finished with the texture.
+        if let Some(buffer) = self.buffer.take() {
+            return_buffer(&self.shared, buffer);
+        }
     }
+}
+
+/// Return an in-use buffer to the pool: the one bookkeeping path shared
+/// by [`ExportedFrame`]'s drop and the wgpu import's drop callback.
+/// After teardown the buffer just idles in `free` until the shared state
+/// drops with it (GL names died with the context; the surface is
+/// released by `SurfaceBuffer`'s own drop).
+fn return_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
+    let mut state = shared.state.lock();
+    state.in_use -= 1;
+    state.free.push(buffer);
 }
 
 impl std::fmt::Debug for ExportedFrame {

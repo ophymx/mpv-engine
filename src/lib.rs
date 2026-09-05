@@ -41,7 +41,11 @@
 //! backend (`Engine::attach_exported_render`): the engine renders on a
 //! hidden GL context of its own and hands the shell zero-copy
 //! IOSurface-backed frames (`ExportedFrame`) for Metal/wgpu import — no
-//! GL and no pixel copies in the shell. Event delivery is pull-based
+//! GL and no pixel copies in the shell. The `wgpu` feature (implies
+//! `export`, wgpu-major-locked) adds `ExportedFrame::into_wgpu_texture`,
+//! which wraps the frame as a `wgpu::Texture` on the shell's device and
+//! ties the pool buffer's return to wgpu's own GPU-completion tracking.
+//! Event delivery is pull-based
 //! ([`Engine::pump_events`]) with an optional push signal
 //! ([`Engine::set_wakeup_callback`]) for shells that don't want a
 //! polling timer.
