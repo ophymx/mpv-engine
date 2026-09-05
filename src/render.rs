@@ -172,7 +172,10 @@ impl SwRender {
     /// Create a software render context co-owning `core` and register
     /// `on_update` (same contract as the GL backend: fires once
     /// synchronously here, afterwards from mpv's render thread).
-    pub(crate) fn create(core: Arc<Mpv>, on_update: impl Fn() + Send + Sync + 'static) -> Result<Self> {
+    pub(crate) fn create(
+        core: Arc<Mpv>,
+        on_update: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
         let mut ctx = OwnedRenderContext::new_software(core)?;
         ctx.set_update_callback(on_update);
         Ok(Self(ctx))
