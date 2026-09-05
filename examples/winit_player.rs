@@ -57,12 +57,12 @@ mod player {
             ..Default::default()
         }))
         .expect("no wgpu adapter for the native backend");
-        let mut device_descriptor = wgpu::DeviceDescriptor::default();
-        #[cfg(target_os = "linux")]
-        {
+        let device_descriptor = wgpu::DeviceDescriptor {
             // The dmabuf import is behind an explicit wgpu opt-in.
-            device_descriptor.required_features = wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
-        }
+            #[cfg(target_os = "linux")]
+            required_features: wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF,
+            ..Default::default()
+        };
         let (device, queue) =
             pollster::block_on(adapter.request_device(&device_descriptor)).expect("wgpu device");
 
@@ -110,6 +110,24 @@ mod player {
 
         fn redraw(&mut self) {
             let Some(gfx) = &self.gfx else { return };
+            // Take the surface *before* consuming a frame: acquiring
+            // first would discard the newest frame on every bail-out
+            // below, and a paused or ended video never publishes a
+            // replacement — leaving the surface here keeps the frame
+            // published (newest-wins) for the retry.
+            use wgpu::CurrentSurfaceTexture as Cst;
+            let target = match gfx.surface.get_current_texture() {
+                Cst::Success(target) | Cst::Suboptimal(target) => target,
+                Cst::Timeout | Cst::Occluded => return,
+                Cst::Outdated | Cst::Lost | Cst::Validation => {
+                    // Reconfigure and retry — the unconsumed frame is
+                    // still waiting, so a redraw completes even when
+                    // mpv will never publish another one.
+                    gfx.surface.configure(&gfx.device, &gfx.config);
+                    gfx.window.request_redraw();
+                    return;
+                }
+            };
             let Ok(Some(frame)) = self.engine.acquire_frame() else {
                 return; // nothing new published since the last acquire
             };
@@ -117,16 +135,6 @@ mod player {
                 Ok(texture) => texture,
                 Err(e) => {
                     eprintln!("frame import failed: {e}");
-                    return;
-                }
-            };
-            use wgpu::CurrentSurfaceTexture as Cst;
-            let target = match gfx.surface.get_current_texture() {
-                Cst::Success(target) | Cst::Suboptimal(target) => target,
-                Cst::Timeout | Cst::Occluded => return,
-                Cst::Outdated | Cst::Lost | Cst::Validation => {
-                    // Reconfigure and wait for the next frame.
-                    gfx.surface.configure(&gfx.device, &gfx.config);
                     return;
                 }
             };

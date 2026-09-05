@@ -28,17 +28,21 @@ fn wgpu_device() -> Option<(wgpu::Device, wgpu::Queue)> {
             return None;
         }
     };
-    let mut device_descriptor = wgpu::DeviceDescriptor::default();
     #[cfg(target_os = "linux")]
-    {
+    let device_descriptor = {
         // The Linux import is behind an explicit wgpu feature opt-in.
         let needed = wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
         if !adapter.features().contains(needed) {
             eprintln!("skipping: adapter lacks VULKAN_EXTERNAL_MEMORY_DMA_BUF");
             return None;
         }
-        device_descriptor.required_features = needed;
-    }
+        wgpu::DeviceDescriptor {
+            required_features: needed,
+            ..Default::default()
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let device_descriptor = wgpu::DeviceDescriptor::default();
     match pollster::block_on(adapter.request_device(&device_descriptor)) {
         Ok(pair) => Some(pair),
         Err(e) => {

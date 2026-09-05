@@ -242,6 +242,16 @@ impl ExportedRender {
             .as_ref()
             .is_some_and(|t| t.thread().id() == std::thread::current().id())
     }
+
+    /// Detach and hand over the render thread's `JoinHandle`.
+    /// [`Engine::detach_render`](crate::Engine::detach_render) takes it
+    /// on the self path (a detach from inside `on_update`, where the
+    /// drop below cannot join) and parks it, so a later engine call from
+    /// another thread joins the deferred teardown instead of leaving it
+    /// to race process exit.
+    pub(crate) fn take_thread(&mut self) -> Option<JoinHandle<()>> {
+        self.thread.take()
+    }
 }
 
 impl Drop for ExportedRender {
@@ -250,14 +260,16 @@ impl Drop for ExportedRender {
         self.shared.notify();
         if let Some(thread) = self.thread.take() {
             if thread.thread().id() == std::thread::current().id() {
-                // Dropped from inside the render thread's own callback (a
-                // shell detaching — or dropping its last Engine — from
-                // `on_update`): joining would self-deadlock (EDEADLK, a
-                // panic inside Drop). Detach the handle instead; the
-                // shutdown flag is already set, so the thread runs its
-                // normal teardown and exits as soon as the callback
-                // returns. The GL context is freed on the thread it is
-                // current on either way.
+                // Dropped from inside the render thread's own callback:
+                // joining would self-deadlock (EDEADLK, a panic inside
+                // Drop). Detach the handle instead; the shutdown flag is
+                // already set, so the thread runs its normal teardown
+                // and exits as soon as the callback returns. The GL
+                // context is freed on the thread it is current on either
+                // way. Only the drop-last-Engine-from-`on_update` case
+                // still lands here — a self `detach_render` extracts the
+                // handle first (`take_thread`) and parks it for a later
+                // join.
                 return;
             }
             let _ = thread.join();
@@ -338,7 +350,20 @@ fn render_thread(
         // also gates rendering to real new-frame updates.
         let wants_frame = updated && ctx.update();
         if wants_frame || force {
-            render_one(&mut ctx, &gl, &shared, &relay);
+            let retry_alloc = render_one(&mut ctx, &gl, &shared, &relay);
+            if retry_alloc {
+                // Buffer allocation failed with nothing outstanding (see
+                // `render_one`): no return/retire will ever re-arm this
+                // render, so re-arm it here and back off briefly — a
+                // plain re-loop would spin hot on a persistent failure.
+                // Any notify (shutdown, update, frame activity) cuts the
+                // wait short.
+                shared.force_render.store(true, Ordering::SeqCst);
+                let mut state = shared.state.lock();
+                let _ = shared
+                    .cond
+                    .wait_for(&mut state, std::time::Duration::from_millis(100));
+            }
         }
     }
 
@@ -377,17 +402,22 @@ fn drain_retired(shared: &ExportShared, gl: &platform::GlContext) {
 }
 
 /// Render the current frame into a pool buffer and publish it. Skips
-/// (dropping the frame) when the shell is holding every buffer.
+/// (dropping the frame) when the shell is holding every buffer — a
+/// later buffer return re-arms the render (see `render_dropped`).
+/// Returns `true` when the frame was dropped to a buffer-allocation
+/// failure with **no frames outstanding**: there, no return/retire can
+/// re-arm the render, so the caller must retry on a timer instead.
 fn render_one(
     ctx: &mut OwnedRenderContext,
     gl: &platform::GlContext,
     shared: &Arc<ExportShared>,
     relay: &dyn Fn(),
-) {
+) -> bool {
     let (width, height) = unpack_size(shared.target_size.load(Ordering::SeqCst));
     if width == 0 || height == 0 {
-        return;
+        return false;
     }
+    let mut retry_alloc = false;
     let buffer = {
         let mut state = shared.state.lock();
         // Retire free buffers from before a resize (GL deletion is legal
@@ -421,7 +451,17 @@ fn render_one(
                     }
                     Err(e) => {
                         tracing::warn!("export: buffer allocation failed: {e}");
-                        shared.render_dropped.store(true, Ordering::SeqCst);
+                        if state.in_use == 0 {
+                            // Nothing is outstanding (`free` and
+                            // `published` are empty too, or a buffer
+                            // would have been picked above), so no
+                            // return/retire will convert `render_dropped`
+                            // back into a force — hand the retry to the
+                            // render loop's timer instead.
+                            retry_alloc = true;
+                        } else {
+                            shared.render_dropped.store(true, Ordering::SeqCst);
+                        }
                         None
                     }
                 }
@@ -438,7 +478,9 @@ fn render_one(
             }
         }
     };
-    let Some(buffer) = buffer else { return };
+    let Some(buffer) = buffer else {
+        return retry_alloc;
+    };
     let fbo = OpenGlFbo {
         fbo: buffer.fbo() as i32,
         width: width as i32,
@@ -453,7 +495,7 @@ fn render_one(
     if let Err(e) = ctx.render_opengl(fbo, false, true) {
         tracing::warn!("export render failed: {e}");
         shared.state.lock().free.push(buffer);
-        return;
+        return false;
     }
     gl.publish_barrier();
     {
@@ -463,6 +505,7 @@ fn render_one(
         }
     }
     relay();
+    false
 }
 
 /// One rendered video frame, wrapping the exportable buffer the

@@ -128,3 +128,76 @@ fn detach_from_on_update_does_not_deadlock() {
     std::thread::sleep(Duration::from_millis(300));
     drop(engine);
 }
+
+/// A detach from inside `on_update` defers the render thread's teardown
+/// — and parks its `JoinHandle`, so the next attach *joins* that
+/// teardown instead of racing it. (Review finding: the handle was
+/// discarded, leaving an immediate re-attach able to fail loudly and
+/// the teardown to race process exit.) The re-attach must therefore
+/// succeed first try, with no settling sleep.
+#[test]
+fn reattach_after_callback_detach_succeeds() {
+    let Some((engine, frame, _rx)) = engine_with_frame() else {
+        return;
+    };
+    drop(frame);
+    let engine = Arc::new(engine);
+
+    // Same arming shape as the test above: detach on the first real
+    // publish, from the render thread. The lingering sleep *after* the
+    // detach keeps the old thread — and the mpv render context it frees
+    // only on exit — alive while the main thread already sees an empty
+    // slot and re-attaches, forcing the race window every time.
+    let armed = Arc::new(AtomicBool::new(false));
+    let detached = Arc::new(AtomicBool::new(false));
+    {
+        let cb_engine = Arc::clone(&engine);
+        let armed = Arc::clone(&armed);
+        let detached = Arc::clone(&detached);
+        engine
+            .set_render_update_callback(move || {
+                if armed.load(Ordering::SeqCst) && !detached.swap(true, Ordering::SeqCst) {
+                    cb_engine.detach_render();
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            })
+            .expect("replace callback");
+    }
+    armed.store(true, Ordering::SeqCst);
+    engine.set_export_size(48, 48).expect("force a publish");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while engine.attached_render().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "detach from on_update did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Deliberately no sleep: the empty render slot already implies the
+    // old thread's handle is parked, and the attach joins it — success
+    // must be deterministic, not lucky timing.
+    let (tx, rx) = std::sync::mpsc::channel();
+    engine
+        .attach_exported_render(mpv_engine::ExportOptions::new(64, 64), move || {
+            let _ = tx.send(());
+        })
+        .expect("re-attach after a callback detach should succeed first try");
+
+    // And the new backend is actually live: a forced render publishes.
+    engine.set_export_size(40, 40).expect("resize");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no frame from the re-attached backend"
+        );
+        let _ = rx.recv_timeout(Duration::from_millis(200));
+        match engine.acquire_frame().expect("acquire") {
+            Some(frame) if (frame.width(), frame.height()) == (40, 40) => break,
+            _ => {}
+        }
+    }
+    engine.detach_render();
+}
