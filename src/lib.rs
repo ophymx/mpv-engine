@@ -56,6 +56,8 @@
 //! bridging to a main loop is the shell's job, because that part is
 //! toolkit-shaped.
 
+#![warn(missing_docs)]
+
 mod engine;
 mod error;
 mod render;

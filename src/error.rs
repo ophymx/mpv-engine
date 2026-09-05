@@ -1,8 +1,11 @@
 use thiserror::Error;
 
+/// Everything this crate's fallible calls can return.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// An error from libmpv itself, via rsmpv (its `Display` carries
+    /// mpv's `mpv_error_string` text plus the numeric code).
     #[error("mpv: {0}")]
     Mpv(#[from] rsmpv::Error),
     /// An attach called while a render context is already live. mpv
@@ -16,6 +19,7 @@ pub enum Error {
     RenderBackendMismatch,
 }
 
+/// Shorthand for results carrying this crate's [`enum@Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Diagnostic text for a raw `client.h` `mpv_error` code: mpv's own

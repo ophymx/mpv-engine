@@ -131,9 +131,10 @@ parent projects):
   `MPV_ERROR_INVALID_PARAMETER` in production.
   `loadfile_handles_awkward_filenames` pins the behavior, so it also
   guards binding swaps and future major bumps.
-- **Drop order**: render context strictly before the mpv handle.
-  `Engine` encodes it in an explicit `Drop`; field reordering must not
-  be able to break it silently.
+- **Drop order**: render context strictly before the mpv handle. Since
+  rsmpv 0.2 the ordering is structural — the render context co-owns the
+  core via `Arc<Mpv>`, so there is no `Drop` impl to maintain. Don't
+  reintroduce a path where a render context can outlive its core.
 - **`detach_render` with the GL context current** is the real teardown
   path; `Drop` is only a fallback that can't guarantee it. Don't soften
   that contract in docs or code.

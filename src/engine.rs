@@ -51,7 +51,9 @@ pub enum PlaybackEvent {
         /// [`ObserveId`] returned by [`Engine::observe`], so two
         /// observations of the same property stay distinguishable.
         id: ObserveId,
+        /// The mpv property name, as passed to [`Engine::observe`].
         name: String,
+        /// The new value, in the [`PropertyFormat`] the observation chose.
         value: PropertyValue,
     },
     /// The mpv core is shutting down — e.g. a `quit` issued through
@@ -107,9 +109,13 @@ fn end_reason(reason: EndFileReason) -> EndReason {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum PropertyValue {
+    /// An mpv flag (`MPV_FORMAT_FLAG`).
     Flag(bool),
+    /// A 64-bit integer (`MPV_FORMAT_INT64`).
     Int(i64),
+    /// A double (`MPV_FORMAT_DOUBLE`).
     Double(f64),
+    /// A string (`MPV_FORMAT_STRING`).
     Str(String),
 }
 
@@ -196,9 +202,13 @@ impl PropertyGet for String {}
 /// variant change notifications carry (mpv coerces where it can).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropertyFormat {
+    /// Deliver as [`PropertyValue::Flag`].
     Flag,
+    /// Deliver as [`PropertyValue::Int`].
     Int,
+    /// Deliver as [`PropertyValue::Double`].
     Double,
+    /// Deliver as [`PropertyValue::Str`].
     Str,
 }
 
@@ -221,6 +231,8 @@ impl EngineBuilder {
         self
     }
 
+    /// Create the engine: forces `LC_NUMERIC=C`, applies the queued
+    /// properties, and runs `mpv_initialize`.
     pub fn build(self) -> Result<Engine> {
         ensure_c_numeric_locale();
         let mut builder = Mpv::builder()?;
@@ -358,6 +370,7 @@ impl Engine {
         T::get_property(&self.mpv, name)
     }
 
+    /// Pause (`true`) or resume (`false`) playback.
     pub fn set_paused(&self, paused: bool) -> Result<()> {
         self.set_property("pause", paused)
     }
@@ -393,10 +406,12 @@ impl Engine {
         self.get_property("volume").ok()
     }
 
+    /// Mute (`true`) or unmute (`false`) audio.
     pub fn set_muted(&self, muted: bool) -> Result<()> {
         self.set_property("mute", muted)
     }
 
+    /// Best-effort mute-state query; `false` when nothing is loaded yet.
     pub fn is_muted(&self) -> bool {
         self.get_property("mute").unwrap_or(false)
     }
@@ -422,6 +437,7 @@ impl Engine {
         self.get_property("duration").ok()
     }
 
+    /// Seek to an absolute position in seconds.
     pub fn seek_absolute(&self, secs: f64) -> Result<()> {
         self.command("seek", &[&format!("{secs:.3}"), "absolute"])
     }
@@ -645,6 +661,7 @@ impl Engine {
         }
     }
 
+    /// Whether a render context (of either backend) is currently attached.
     pub fn has_render(&self) -> bool {
         self.render.lock().is_some()
     }
@@ -658,7 +675,10 @@ impl Engine {
     /// no backend is attached. For the GL backend, the attach contract's
     /// GL-currency rule covers this call too.
     pub fn render_update(&self) -> bool {
-        self.render.lock().as_mut().is_some_and(RenderBackend::update)
+        self.render
+            .lock()
+            .as_mut()
+            .is_some_and(RenderBackend::update)
     }
 
     /// Draw the current frame into `fbo` (`0` = default framebuffer) with
