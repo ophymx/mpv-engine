@@ -8,10 +8,92 @@ mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use common::engine_with_frame;
-use mpv_engine::ExportedFrame;
+use mpv_engine::{ExportOptions, ExportedFrame};
+
+/// A continuously-updating source (a looping clip) must keep delivering
+/// frames to the consumer, not just the first one. Regression for the
+/// pool starving the shell: when the render thread reclaimed its own
+/// just-published buffer for the next frame before the consumer's
+/// acquire could win the race, the pool never grew past one live buffer
+/// and every acquire after the first saw an empty slot — a black window
+/// on real video. (The single-frame export suites miss this: their clip
+/// ends and the render thread idles, so the last frame simply waits.)
+#[test]
+fn continuous_source_keeps_delivering_frames() {
+    let Some(engine) = common::video_engine() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clip = dir.path().join("loop.nut");
+    // 60fps so the render thread stays saturated — a low frame rate idles
+    // it between frames, and the consumer then wins the buffer race even
+    // with the bug present, hiding the regression.
+    if generate_fast_clip(&clip).is_none() {
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    if engine
+        .attach_exported_render(ExportOptions::new(128, 128), move || {
+            let _ = tx.send(());
+        })
+        .is_err()
+    {
+        return;
+    }
+    // Loop forever so updates never stop — the condition the bug needs.
+    engine.set_property("loop-file", "inf").expect("loop-file");
+    engine
+        .load_when_ready(clip.to_str().expect("utf-8 path"))
+        .expect("load");
+
+    // Count successful acquisitions over a few seconds of playback. With
+    // the pool healthy this reaches the cap almost immediately; under the
+    // starvation bug it stalls at zero or one. The threshold sits far
+    // below a working rate and far above the broken one, so it is not
+    // timing-fragile.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut acquired = 0;
+    while acquired < 10 && Instant::now() < deadline {
+        let _ = rx.recv_timeout(Duration::from_millis(100));
+        if engine.acquire_frame().expect("acquire").is_some() {
+            acquired += 1;
+        }
+    }
+    assert!(
+        acquired >= 5,
+        "continuous source starved the consumer: only {acquired} frame(s) acquired \
+         (pool never grew past the published buffer?)"
+    );
+    engine.detach_render();
+}
+
+/// 2 seconds of 128x128 video at 60fps (rawvideo in NUT), so the export
+/// render thread never idles between frames. None when ffmpeg is absent.
+fn generate_fast_clip(target: &std::path::Path) -> Option<()> {
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=128x128:rate=60",
+            "-t",
+            "2",
+            "-c:v",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    matches!(status, Ok(s) if s.success()).then_some(())
+}
 
 /// A forced re-render (`set_export_size`) landing while the shell holds
 /// every pool buffer must not be lost: it re-arms when a frame handle

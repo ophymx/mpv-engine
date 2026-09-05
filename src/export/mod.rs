@@ -435,15 +435,24 @@ fn render_one(
         if let Some(buffer) = state.free.pop() {
             Some(buffer)
         } else {
-            // Steal an unconsumed published frame before growing: the
-            // shell skipped it, and newest-wins is the display policy.
+            // A published frame from before a resize is the wrong size —
+            // useless to us and to the shell — so retire it up front.
             if let Some(mut stale) = state.published.take_if(|b| b.size() != (width, height)) {
                 stale.delete_gl(gl);
                 state.live -= 1;
             }
-            if let Some(buffer) = state.published.take() {
-                Some(buffer)
-            } else if state.live < shared.pool_size {
+            // Grow the pool *before* reclaiming an unconsumed published
+            // frame. Keeping that frame acquirable is what lets a
+            // continuously-updating source actually reach the shell:
+            // reclaim-first would have the render thread take its own
+            // just-published buffer back for the next frame every tick,
+            // beating the consumer's acquire (which carries thread
+            // wakeup latency) to it — the pool would never grow past one
+            // live buffer and the shell would starve (a black window on
+            // real video). Newest-wins still holds: once at capacity the
+            // published frame *is* reclaimed below, and `render_one`'s
+            // publish step replaces an unconsumed frame regardless.
+            if state.live < shared.pool_size {
                 match SurfaceBuffer::new(gl, width, height) {
                     Ok(buffer) => {
                         state.live += 1;
@@ -451,20 +460,27 @@ fn render_one(
                     }
                     Err(e) => {
                         tracing::warn!("export: buffer allocation failed: {e}");
-                        if state.in_use == 0 {
-                            // Nothing is outstanding (`free` and
-                            // `published` are empty too, or a buffer
-                            // would have been picked above), so no
-                            // return/retire will convert `render_dropped`
-                            // back into a force — hand the retry to the
-                            // render loop's timer instead.
+                        // Fall back to the published frame if there is
+                        // one; else there's nothing to render into.
+                        if let Some(buffer) = state.published.take() {
+                            Some(buffer)
+                        } else if state.in_use == 0 {
+                            // Nothing outstanding, so no return/retire
+                            // will convert `render_dropped` back into a
+                            // force — hand the retry to the render loop's
+                            // timer instead.
                             retry_alloc = true;
+                            None
                         } else {
                             shared.render_dropped.store(true, Ordering::SeqCst);
+                            None
                         }
-                        None
                     }
                 }
+            } else if let Some(buffer) = state.published.take() {
+                // Pool at capacity: reclaim the unconsumed published
+                // frame (newest-wins — the shell skipped it).
+                Some(buffer)
             } else {
                 tracing::debug!(
                     "export: shell holds all {} buffers; dropping frame",
