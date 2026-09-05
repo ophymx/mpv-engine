@@ -31,7 +31,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as platform;
 #[cfg(all(feature = "wgpu", target_os = "macos"))]
-mod wgpu;
+mod wgpu_macos;
 #[cfg(all(feature = "wgpu", target_os = "linux"))]
 mod wgpu_linux;
 
