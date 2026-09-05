@@ -11,7 +11,12 @@ use std::time::Duration;
 use mpv_engine::{EndReason, Engine, PlaybackEvent, PropertyFormat, PropertyValue};
 
 fn headless_engine() -> Option<Engine> {
-    match Engine::headless().build() {
+    // `headless()` nulls only the video output — audio stays real because
+    // audio-only playback is its point. Tests must null the audio side
+    // too: on a CI box with no sound server, mpv's AO probe reaches
+    // PulseAudio's client lib, which hard-aborts the whole test process
+    // (`pa_mainloop_prepare(): Assertion 'm->state == STATE_PASSIVE'`).
+    match Engine::headless().property("ao", "null").build() {
         Ok(e) => Some(e),
         Err(e) => {
             eprintln!("skipping: mpv engine unavailable: {e}");
