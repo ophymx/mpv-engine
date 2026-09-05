@@ -212,6 +212,10 @@ pub enum PropertyFormat {
     Str,
 }
 
+/// The shell's render-update callback as held in the engine's relay
+/// slot (see [`Engine::render_update_cb`]).
+type UpdateCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// Handle returned by [`Engine::observe`]: tags that observation's
 /// [`PropertyChanged`](PlaybackEvent::PropertyChanged) events and cancels
 /// it via [`Engine::unobserve`].
@@ -247,6 +251,7 @@ impl EngineBuilder {
             next_observe_id: AtomicU64::new(1),
             pending_load: Mutex::new(None),
             deferred_events: Mutex::new(Vec::new()),
+            render_update_cb: Arc::new(Mutex::new(Arc::new(|| {}) as UpdateCallback)),
             mpv,
         })
     }
@@ -299,6 +304,16 @@ pub struct Engine {
     /// when a deferred load errors at attach time, so the attach methods'
     /// `Err` can keep meaning "no context was attached".
     deferred_events: Mutex<Vec<PlaybackEvent>>,
+    /// The live render-update callback, behind the relay closure that is
+    /// what actually gets registered with rsmpv at attach.
+    /// [`set_render_update_callback`](Engine::set_render_update_callback)
+    /// swaps this slot instead of re-registering through FFI, so the
+    /// swap holds no engine lock across a callback invocation — the
+    /// relay clones the `Arc` out under a short lock and invokes with
+    /// the lock released. All mutation goes through
+    /// [`set_update_slot`](Engine::set_update_slot), which drops the
+    /// displaced closure outside the lock.
+    render_update_cb: Arc<Mutex<UpdateCallback>>,
     /// Shared with any live render context, which holds its own clone.
     mpv: Arc<Mpv>,
 }
@@ -746,15 +761,31 @@ impl Engine {
             return Err(Error::AlreadyAttached);
         }
         // Construct with the render lock *released*: registration fires
-        // `on_update` synchronously, and holding the render lock across
-        // that call would deadlock an `on_update` that touches render
-        // methods. The attach lock keeps a second attacher out, so the
-        // slot check above stays authoritative. (An Arc clone goes in —
-        // never the engine's own reference — so a failed create can't
-        // drop the core.)
+        // `on_update` synchronously (via the relay), and holding the
+        // render lock across that call would deadlock an `on_update` that
+        // touches render methods. The attach lock keeps a second attacher
+        // out, so the slot check above stays authoritative. (An Arc clone
+        // goes in — never the engine's own reference — so a failed create
+        // can't drop the core.)
+        self.set_update_slot(Arc::new(on_update));
         // SAFETY: GL-currency contract forwarded to the caller (above).
-        let render =
-            unsafe { GlRender::create(self.mpv.clone(), get_proc_address, options, on_update)? };
+        let created = unsafe {
+            GlRender::create(
+                self.mpv.clone(),
+                get_proc_address,
+                options,
+                self.update_relay(),
+            )
+        };
+        let render = match created {
+            Ok(r) => r,
+            Err(e) => {
+                // Failed attach: don't pin the shell closure's captures
+                // in a slot nothing will ever fire.
+                self.set_update_slot(Arc::new(|| {}));
+                return Err(e);
+            }
+        };
         *self.render.lock() = Some(RenderBackend::Gl(render));
         tracing::debug!("mpv GL render context attached");
         self.drain_pending_load();
@@ -784,7 +815,14 @@ impl Engine {
         if self.render.lock().is_some() {
             return Err(Error::AlreadyAttached);
         }
-        let render = SwRender::create(self.mpv.clone(), on_update)?;
+        self.set_update_slot(Arc::new(on_update));
+        let render = match SwRender::create(self.mpv.clone(), self.update_relay()) {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_update_slot(Arc::new(|| {}));
+                return Err(e);
+            }
+        };
         *self.render.lock() = Some(RenderBackend::Sw(render));
         tracing::debug!("mpv software render context attached");
         self.drain_pending_load();
@@ -842,13 +880,19 @@ impl Engine {
     /// immediately instead of parking.
     pub fn detach_render(&self) {
         if self.render.lock().take().is_some() {
+            // Release the shell's callback with the context: nothing can
+            // fire it anymore, and keeping it would pin its captures
+            // (typically shell window state) until the next attach.
+            self.set_update_slot(Arc::new(|| {}));
             tracing::debug!("mpv render context detached");
         }
     }
 
-    /// Whether a render context (of either backend) is currently attached.
+    /// Whether a render context (of either backend) is currently
+    /// attached. Delegates to [`attached_render`](Self::attached_render)
+    /// — one read of the slot, so the two can never disagree.
     pub fn has_render(&self) -> bool {
-        self.render.lock().is_some()
+        self.attached_render().is_some()
     }
 
     /// Which render backend is attached, if any — the "which one"
@@ -858,6 +902,30 @@ impl Engine {
     /// state of their own.
     pub fn attached_render(&self) -> Option<RenderKind> {
         self.render.lock().as_ref().map(RenderBackend::kind)
+    }
+
+    /// Store `cb` as the live render-update callback, dropping the
+    /// displaced closure *outside* the slot lock — its captures may carry
+    /// a `Drop` that calls back into the engine, which must not run under
+    /// any engine lock.
+    fn set_update_slot(&self, cb: UpdateCallback) {
+        let old = std::mem::replace(&mut *self.render_update_cb.lock(), cb);
+        drop(old);
+    }
+
+    /// The closure actually registered with rsmpv at attach: reads the
+    /// engine's callback slot on every fire, so
+    /// [`set_render_update_callback`](Self::set_render_update_callback)
+    /// can swap the target without re-registering through FFI. The `Arc`
+    /// is cloned out under a short lock and invoked with the lock
+    /// released — no engine lock is ever held across a callback
+    /// invocation.
+    fn update_relay(&self) -> impl Fn() + Send + Sync + 'static {
+        let slot = Arc::clone(&self.render_update_cb);
+        move || {
+            let cb = Arc::clone(&*slot.lock());
+            cb();
+        }
     }
 
     /// Replace the render-update callback registered at attach — the same
@@ -871,18 +939,23 @@ impl Engine {
     /// The new callback takes over the attach-time contract: it fires on
     /// mpv's render thread — and **once synchronously on the calling
     /// thread, from inside this very call** (registration raises an
-    /// update immediately). Do no work and call no engine methods
-    /// inside — signal your main loop and render/pump from there. That
-    /// rule is load-bearing here in a way it isn't at attach: the
-    /// synchronous fire happens while the engine's internal render lock
-    /// is held, so an engine render call from inside the callback
-    /// deadlocks rather than no-ops. (rsmpv imposes the same no-reentry
-    /// rule on the raw seam.)
+    /// update immediately, so a frame signaled to the old callback isn't
+    /// lost). The synchronous fire runs outside every engine lock, same
+    /// as at attach — an engine call from inside it cannot deadlock. The
+    /// standing rule still applies to the mpv-thread fires, though: do no
+    /// work and call no engine methods inside — signal your main loop and
+    /// render/pump from there.
     ///
-    /// The replaced closure is released once its last in-flight
-    /// invocation finishes. The registration is tied to the attached
-    /// context: [`detach_render`](Self::detach_render) drops it, and the
-    /// next attach starts from that attach's own `on_update`.
+    /// The replaced closure is released with no engine lock held: on this
+    /// thread during this call when no invocation is in flight, otherwise
+    /// when its last in-flight invocation finishes — possibly on an
+    /// mpv-internal thread, so captures whose `Drop` calls into libmpv
+    /// (e.g. a last `Engine`-owning handle) don't belong in an update
+    /// callback.
+    ///
+    /// The registration is tied to the attached context:
+    /// [`detach_render`](Self::detach_render) releases it, and the next
+    /// attach starts from that attach's own `on_update`.
     ///
     /// Errors with [`Error::NotAttached`] when no render context is
     /// attached — a callback that could never fire is a wiring bug,
@@ -891,13 +964,14 @@ impl Engine {
         &self,
         on_update: impl Fn() + Send + Sync + 'static,
     ) -> Result<()> {
-        match self.render.lock().as_mut() {
-            Some(backend) => {
-                backend.set_update_callback(on_update);
-                Ok(())
-            }
-            None => Err(Error::NotAttached),
+        if !self.has_render() {
+            return Err(Error::NotAttached);
         }
+        let new: UpdateCallback = Arc::new(on_update);
+        self.set_update_slot(Arc::clone(&new));
+        // The synchronous registration fire, with no engine lock held.
+        new();
+        Ok(())
     }
 
     /// Process pending render work after an update callback fired (never

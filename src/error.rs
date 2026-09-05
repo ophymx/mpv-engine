@@ -17,10 +17,17 @@ pub enum Error {
     /// shell, surfaced loudly rather than silently dropped.
     #[error("render call does not match the attached render backend")]
     RenderBackendMismatch,
-    /// A call that needs a live render context ran before any attach —
-    /// e.g. registering a render-update callback that could never fire.
-    /// Like [`RenderBackendMismatch`](Self::RenderBackendMismatch), a
-    /// wiring bug surfaced loudly rather than silently dropped.
+    /// A call that needs a live render context ran before any attach.
+    /// Today only
+    /// [`Engine::set_render_update_callback`](crate::Engine::set_render_update_callback)
+    /// returns this — a callback that could never fire is a wiring bug,
+    /// surfaced loudly like
+    /// [`RenderBackendMismatch`](Self::RenderBackendMismatch). The frame
+    /// path deliberately does *not* use it: unattached,
+    /// `render_gl`/`render_sw` return `Ok` untouched and `render_update`
+    /// returns `false`, because "not attached yet" is an ordinary
+    /// startup state there, not a bug — don't match on this variant to
+    /// detect a missing attach from a draw handler.
     #[error("no render context is attached")]
     NotAttached,
 }

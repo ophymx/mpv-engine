@@ -51,7 +51,8 @@ Owned here today:
   the wakeup seam's replaceability) — for shells whose real closure can
   only capture state built *after* the engine is shared: attach with a
   placeholder, wrap the engine, then register the weak-capturing
-  closure.
+  closure. The replacement's synchronous registration fire runs outside
+  every engine lock — the same contract as the attach-time fire.
 - `load_paused()` — pause set *before* `loadfile`, so demuxing doesn't
   start before the shell's window is mapped (the init-time variant of the
   same idea tends to hang).

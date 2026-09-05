@@ -133,18 +133,6 @@ impl RenderBackend {
             RenderBackend::Sw(_) => RenderKind::Software,
         }
     }
-
-    /// Replace the update callback on the live context (either backend).
-    /// Forwards rsmpv's registration semantics: the new callback is
-    /// raised synchronously on the calling thread from inside this call,
-    /// and the replaced closure is freed once its last in-flight
-    /// invocation finishes.
-    pub(crate) fn set_update_callback(&mut self, on_update: impl Fn() + Send + Sync + 'static) {
-        match self {
-            RenderBackend::Gl(r) => r.ctx.set_update_callback(on_update),
-            RenderBackend::Sw(r) => r.0.set_update_callback(on_update),
-        }
-    }
 }
 
 pub(crate) struct GlRender {

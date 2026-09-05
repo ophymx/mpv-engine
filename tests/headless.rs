@@ -107,6 +107,16 @@ fn pump_until(engine: &Engine, mut stop: impl FnMut(&PlaybackEvent) -> bool) -> 
     false
 }
 
+/// Poll `pred` at [`pump_until`]'s cadence (50ms interval, ~5s deadline)
+/// until it holds — the one home for the wait/timeout policy, so a
+/// flakiness fix lands everywhere at once.
+fn wait_until(mut pred: impl FnMut() -> bool) -> bool {
+    (0..100).any(|_| {
+        std::thread::sleep(Duration::from_millis(50));
+        pred()
+    })
+}
+
 /// [`pump_until`]'s negative-check twin: drain events for roughly `dur`
 /// at the same cadence and return everything seen — for asserting what
 /// must NOT arrive inside a window.
@@ -208,10 +218,7 @@ fn load_paused_holds_until_unpaused() {
 
     engine.set_paused(false).unwrap();
     assert!(!engine.is_paused());
-    let advanced = (0..100).any(|_| {
-        std::thread::sleep(Duration::from_millis(50));
-        engine.position() > held
-    });
+    let advanced = wait_until(|| engine.position() > held);
     assert!(advanced, "position must advance after unpausing");
 }
 
@@ -471,21 +478,12 @@ fn sw_render_produces_opaque_rgba_frames() {
         ev,
         PlaybackEvent::Loaded
     )));
-    let ready = (0..100).any(|_| {
-        std::thread::sleep(Duration::from_millis(50));
-        frame_ready.load(Ordering::SeqCst)
-    });
+    let ready = wait_until(|| frame_ready.load(Ordering::SeqCst));
     assert!(ready, "update callback must signal a frame");
 
     // The signaled frame must also be visible through the pull side of
     // the seam: `render_update` reports a frame wants drawing.
-    let update_frame = (0..100).any(|_| {
-        if engine.render_update() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-        false
-    });
+    let update_frame = wait_until(|| engine.render_update());
     assert!(update_frame, "render_update must report the pending frame");
 
     let mut buf = Vec::new();
@@ -531,10 +529,7 @@ fn wakeup_callback_fires_on_events() {
     woke.store(false, Ordering::SeqCst);
 
     engine.load(source.to_str().unwrap()).unwrap();
-    let signaled = (0..100).any(|_| {
-        std::thread::sleep(Duration::from_millis(50));
-        woke.load(Ordering::SeqCst)
-    });
+    let signaled = wait_until(|| woke.load(Ordering::SeqCst));
     assert!(signaled, "wakeup must fire when events queue");
     assert!(
         pump_until(&engine, |ev| matches!(ev, PlaybackEvent::Loaded)),
@@ -583,7 +578,6 @@ fn attached_render_reports_backend_kind() {
         engine.attached_render(),
         Some(mpv_engine::RenderKind::Software)
     );
-    assert!(engine.has_render(), "kind and has_render must agree");
 
     engine.detach_render();
     assert_eq!(engine.attached_render(), None);
@@ -647,23 +641,21 @@ fn render_update_callback_replaces_attach_registration() {
             replacement_counter.fetch_add(1, Ordering::SeqCst);
         })
         .unwrap();
-    let raised = (0..100).any(|_| {
-        std::thread::sleep(Duration::from_millis(10));
-        replacement_fires.load(Ordering::SeqCst) >= 1
-    });
-    assert!(raised, "registration must raise the replacement callback");
-
-    // Any in-flight invocation of the attach-time closure finishes well
-    // within this settle window; from here on its count must not move.
-    std::thread::sleep(Duration::from_millis(50));
+    // The registration fire is synchronous — inside the call, like the
+    // attach-time fire asserted above. A poll here would keep passing if
+    // that guarantee regressed to "eventually"; a plain assert pins it.
+    assert!(
+        replacement_fires.load(Ordering::SeqCst) >= 1,
+        "registration must raise the replacement callback synchronously"
+    );
+    // No async dispatch source exists before load() — nothing else can
+    // move the attach counter from here on.
     let attach_count_after_swap = attach_fires.load(Ordering::SeqCst);
 
     engine.load(source.to_str().unwrap()).unwrap();
     let before_frames = replacement_fires.load(Ordering::SeqCst);
-    let frames_signaled = (0..100).any(|_| {
-        std::thread::sleep(Duration::from_millis(50));
-        replacement_fires.load(Ordering::SeqCst) > before_frames
-    });
+    let frames_signaled =
+        wait_until(|| replacement_fires.load(Ordering::SeqCst) > before_frames);
     assert!(
         frames_signaled,
         "frame updates must land on the replacement callback"
@@ -672,6 +664,33 @@ fn render_update_callback_replaces_attach_registration() {
         attach_fires.load(Ordering::SeqCst),
         attach_count_after_swap,
         "the replaced attach-time callback must not fire after the swap"
+    );
+}
+
+/// The swap's synchronous fire runs outside every engine lock: a
+/// replacement callback that queries the engine must not deadlock — the
+/// regression shape for the fire-under-the-render-lock bug. (A regressed
+/// engine hangs here, which is the loudest failure a deadlock can give.)
+#[test]
+fn render_update_callback_sync_fire_holds_no_engine_lock() {
+    let Some(engine) = video_engine() else {
+        return;
+    };
+    engine.attach_sw_render(|| {}).unwrap();
+    let engine = Arc::new(engine);
+    let probe = Arc::downgrade(&engine);
+    let saw_context = Arc::new(AtomicBool::new(false));
+    let saw = saw_context.clone();
+    engine
+        .set_render_update_callback(move || {
+            if let Some(e) = probe.upgrade() {
+                saw.store(e.has_render(), Ordering::SeqCst);
+            }
+        })
+        .unwrap();
+    assert!(
+        saw_context.load(Ordering::SeqCst),
+        "the sync fire must see the live context, without deadlocking"
     );
 }
 
