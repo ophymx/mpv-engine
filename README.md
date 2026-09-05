@@ -72,6 +72,15 @@ Owned here today:
   (`RenderKind`), so shells routing between per-backend paths (GPU
   texture sampling vs. RGBA upload) don't track the attach outcome in
   state of their own.
+- An exported-frame backend on macOS (non-default `export` feature):
+  `attach_exported_render` spawns an engine-owned render thread with a
+  hidden CGL context, mpv renders into IOSurface-backed framebuffers
+  there, and the shell pulls zero-copy `ExportedFrame` handles
+  (`acquire_frame`) to import into Metal/wgpu — the consumer-side answer
+  to libmpv's GL-or-software render API, with no GL and no pixel copies
+  in the shell. Fully safe API (the GL-currency contract never crosses
+  it), newest-wins frame pool, live resizing (`set_export_size`), and
+  BGRA8 row-0-at-top output pinned by an orientation test.
 - An event wakeup seam (`set_wakeup_callback`) so shells get a push
   signal when events queue instead of polling `pump_events` on a timer —
   the only timely path for audio-only use or failures while paused.
@@ -116,10 +125,13 @@ Avoid libepoxy on glvnd builds: it doesn't export core GL symbols as
 
 ## Roadmap (planned non-default features)
 
+The macOS half of the export story has shipped as the `export` feature
+(IOSurface — see above); the rows below are the Linux/Vulkan analog.
+
 | feature | contents | churn it contains |
 |---|---|---|
 | `egl` | side EGL context + FBO render + RGBA readback (GL-accelerated; the pure-software path is already in core as `render_sw`) | none — stable APIs |
-| `export` | `ExportedFrame`: OPAQUE_FD/DMA-BUF + GL semaphore export (ash only) | the *permanent* workarounds — e.g. wgpu-hal never enables `VK_KHR_external_semaphore_fd`, so the strict-loader `vkGetSemaphoreFdKHR` path lives here indefinitely |
+| `export` (Linux) | `ExportedFrame`: OPAQUE_FD/DMA-BUF + GL semaphore export (ash only) | the *permanent* workarounds — e.g. wgpu-hal never enables `VK_KHR_external_semaphore_fd`, so the strict-loader `vkGetSemaphoreFdKHR` path lives here indefinitely |
 | `wgpu` | import `ExportedFrame` → `wgpu::Texture` via wgpu-hal | wgpu-major lockstep, isolated behind a non-default feature; releases track wgpu majors (the `egui-wgpu` pattern). When iced reaches wgpu 30, `add_wait_semaphore` replaces the empty-submit semaphore hack and `create_texture_from_hal`'s `initial_state` lands — internals change, the feature's API doesn't |
 
 The default feature set never grows unstable dependencies: a consumer on
@@ -134,7 +146,11 @@ adapter crate — those items fail the interface-survival rule.
 `cargo test` runs headless against real libmpv (`vo=null`); media inputs
 are generated with ffmpeg. Both are probed at runtime — missing tooling
 skips tests rather than failing them. System deps: the libmpv dev
-package to build, ffmpeg to generate test inputs.
+package to build, ffmpeg to generate test inputs. With
+`--features export` on macOS, the exported-backend tests additionally
+render through a real hidden CGL context and read pixels back through
+the IOSurface — a session without WindowServer/GPU access skips them the
+same way.
 
 ## Invariants for contributors
 

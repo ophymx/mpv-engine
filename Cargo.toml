@@ -16,6 +16,16 @@ categories = ["multimedia::video"]
 # (`egl`, `export`, `wgpu`) get their own entries when implemented — see
 # README "Roadmap".
 
+[features]
+# Exported-frame render backend (macOS today): the engine owns a hidden
+# CGL context on a dedicated render thread, renders into IOSurface-backed
+# framebuffers, and hands the shell zero-copy frame handles for Metal /
+# wgpu import. Links the OpenGL, IOSurface and CoreFoundation frameworks
+# directly — no new Rust dependencies, per the policy above. On other
+# platforms the feature currently compiles to nothing (the Linux DMA-BUF
+# analog is roadmap).
+export = []
+
 [dependencies]
 libc = "0.2"
 # rsmpv/rsmpv-sys are permissively licensed (MIT OR Apache-2.0 / ISC)

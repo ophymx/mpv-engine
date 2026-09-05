@@ -24,7 +24,7 @@
 //! the sealed [`PropertyGet`]), so the underlying binding's traits never
 //! enter this crate's public API.
 //!
-//! Two render backends share one attach slot: OpenGL
+//! The render backends share one attach slot: OpenGL
 //! ([`Engine::attach_gl_render`] / [`Engine::render_gl`]) and software
 //! ([`Engine::attach_sw_render`] / [`Engine::render_sw`], RGBA into a
 //! caller buffer, no GL anywhere). [`Engine::attached_render`] reports
@@ -36,7 +36,12 @@
 //! to fix the shell's render-loop discipline: whether `render_gl` blocks
 //! until the frame's target time (right for a toolkit paint handler,
 //! wrong on a compositor thread), and mpv's advanced control (which
-//! obligates [`Engine::render_update`] after every update callback). Event delivery is pull-based
+//! obligates [`Engine::render_update`] after every update callback).
+//! On macOS the non-default `export` feature adds a third, fully safe
+//! backend (`Engine::attach_exported_render`): the engine renders on a
+//! hidden GL context of its own and hands the shell zero-copy
+//! IOSurface-backed frames (`ExportedFrame`) for Metal/wgpu import — no
+//! GL and no pixel copies in the shell. Event delivery is pull-based
 //! ([`Engine::pump_events`]) with an optional push signal
 //! ([`Engine::set_wakeup_callback`]) for shells that don't want a
 //! polling timer.
@@ -67,6 +72,8 @@
 
 mod engine;
 mod error;
+#[cfg(all(feature = "export", target_os = "macos"))]
+mod export;
 mod render;
 
 pub use engine::{
@@ -74,4 +81,6 @@ pub use engine::{
     PropertyValue,
 };
 pub use error::{Error, Result};
+#[cfg(all(feature = "export", target_os = "macos"))]
+pub use export::{ExportOptions, ExportedFrame};
 pub use render::{GlRenderOptions, ProcAddressFn, RenderKind};

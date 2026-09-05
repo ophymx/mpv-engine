@@ -5,6 +5,8 @@ use parking_lot::Mutex;
 use rsmpv::{EndFileReason, Event, Format, Mpv, PropertyData, sys};
 
 use crate::error::{Error, Result, describe_code};
+#[cfg(all(feature = "export", target_os = "macos"))]
+use crate::export::{ExportOptions, ExportedFrame, ExportedRender};
 use crate::render::{
     GlRender, GlRenderOptions, ProcAddressFn, RenderBackend, RenderKind, SwRender,
 };
@@ -881,7 +883,15 @@ impl Engine {
     /// defer-or-load decision reads the live `vo`, so loads then run
     /// immediately instead of parking.
     pub fn detach_render(&self) {
-        if self.render.lock().take().is_some() {
+        // Take under the render lock, drop with it released: the exported
+        // backend's drop joins its render thread, and an in-flight
+        // frame-published callback calling `acquire_frame` (which takes
+        // the render lock) would deadlock against a join performed under
+        // it. (The guard is a temporary of the `let`, so it is released
+        // before the drop below.)
+        let taken = self.render.lock().take();
+        if taken.is_some() {
+            drop(taken);
             // Release the shell's callback with the context: nothing can
             // fire it anymore, and keeping it would pin its captures
             // (typically shell window state) until the next attach.
@@ -1016,6 +1026,100 @@ impl Engine {
     pub fn render_sw(&self, w: i32, h: i32, buf: &mut Vec<u8>) -> Result<()> {
         match self.render.lock().as_mut() {
             Some(RenderBackend::Sw(r)) => r.render(w, h, buf),
+            Some(_) => Err(Error::RenderBackendMismatch),
+            None => Ok(()),
+        }
+    }
+
+    /// Create the exported-frame render backend (`export` feature): the
+    /// engine spawns a render thread owning a hidden GL context, mpv
+    /// renders there into IOSurface-backed framebuffers, and the shell
+    /// pulls zero-copy [`ExportedFrame`]s with
+    /// [`acquire_frame`](Self::acquire_frame) to import into Metal/wgpu.
+    /// Fully safe — no GL context or currency contract crosses this API;
+    /// the thread that creates the context is the thread that renders on
+    /// it and frees it.
+    ///
+    /// `on_update` differs from the other backends' callback: it fires
+    /// **after a frame is published**, from the engine's own render
+    /// thread (plus the usual synchronous fire when
+    /// [`set_render_update_callback`](Self::set_render_update_callback)
+    /// replaces it). Calling [`acquire_frame`](Self::acquire_frame)
+    /// inside it is fine; just don't block in it — it stalls video
+    /// pacing. Frames published before the shell drains them are
+    /// replaced, newest wins.
+    ///
+    /// Shares the single render slot with the other backends
+    /// ([`Error::AlreadyAttached`]); [`detach_render`](Self::detach_render)
+    /// shuts the render thread down (no GL-currency obligation for the
+    /// caller — unique among the GL-based backends), and a successful
+    /// attach issues any [`load_when_ready`](Self::load_when_ready)
+    /// queue, with the same failure routing as the other attach methods.
+    ///
+    /// Errors with [`Error::ExportSetup`] when no GL context can be
+    /// created — typically a session without WindowServer/GPU access;
+    /// treat it like a missing display.
+    #[cfg(all(feature = "export", target_os = "macos"))]
+    pub fn attach_exported_render(
+        &self,
+        options: ExportOptions,
+        on_update: impl Fn() + Send + Sync + 'static,
+    ) -> Result<()> {
+        // Same locking shape as `attach_gl_render`, for the same reasons.
+        let _attaching = self.attach.lock();
+        if self.render.lock().is_some() {
+            return Err(Error::AlreadyAttached);
+        }
+        self.set_update_slot(Arc::new(on_update));
+        let created = ExportedRender::create(self.mpv.clone(), options, self.update_relay());
+        let render = match created {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_update_slot(Arc::new(|| {}));
+                return Err(e);
+            }
+        };
+        *self.render.lock() = Some(RenderBackend::Exported(render));
+        tracing::debug!("mpv exported (IOSurface) render context attached");
+        self.drain_pending_load();
+        Ok(())
+    }
+
+    /// Take the newest published frame from the exported backend, if one
+    /// is waiting. `Ok(None)` both when no frame has been published since
+    /// the last acquire and when no backend is attached (ordinary startup
+    /// state, mirroring [`render_gl`](Self::render_gl)'s no-op);
+    /// [`Error::RenderBackendMismatch`] when a different backend is
+    /// attached. Callable from any thread, including from inside the
+    /// exported backend's `on_update`.
+    #[cfg(all(feature = "export", target_os = "macos"))]
+    pub fn acquire_frame(&self) -> Result<Option<ExportedFrame>> {
+        // Clone the shared state out under a short slot lock; the take
+        // itself must not hold the render lock (an attach/detach could
+        // block behind an unrelated pool operation otherwise).
+        let shared = match self.render.lock().as_ref() {
+            Some(RenderBackend::Exported(r)) => Arc::clone(r.shared()),
+            Some(_) => return Err(Error::RenderBackendMismatch),
+            None => return Ok(None),
+        };
+        Ok(ExportedFrame::take_published(shared))
+    }
+
+    /// Resize the exported backend's frames: takes effect from the next
+    /// rendered frame (which is forced promptly, so a paused or ended
+    /// video re-renders at the new size instead of waiting for playback
+    /// to produce one). Zero in either dimension pauses rendering until a
+    /// real size arrives — map-before-layout states in a shell.
+    /// No-op `Ok` when nothing is attached;
+    /// [`Error::RenderBackendMismatch`] for a different backend.
+    /// Outstanding [`ExportedFrame`]s keep their original size.
+    #[cfg(all(feature = "export", target_os = "macos"))]
+    pub fn set_export_size(&self, width: u32, height: u32) -> Result<()> {
+        match self.render.lock().as_ref() {
+            Some(RenderBackend::Exported(r)) => {
+                r.shared().set_target_size(width, height);
+                Ok(())
+            }
             Some(_) => Err(Error::RenderBackendMismatch),
             None => Ok(()),
         }

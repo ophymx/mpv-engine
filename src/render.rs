@@ -107,6 +107,12 @@ pub enum RenderKind {
     /// The software backend
     /// ([`Engine::attach_sw_render`](crate::Engine::attach_sw_render)).
     Software,
+    /// The exported-frame backend (`export` feature, macOS —
+    /// `Engine::attach_exported_render`): the engine renders on its own
+    /// hidden GL context and hands the shell zero-copy IOSurface frames.
+    /// The variant exists on every platform so cross-platform shells can
+    /// match on it unconditionally; only the feature produces it.
+    Exported,
 }
 
 /// The one attached render backend. Backends share the engine's single
@@ -115,15 +121,21 @@ pub enum RenderKind {
 pub(crate) enum RenderBackend {
     Gl(GlRender),
     Sw(SwRender),
+    #[cfg(all(feature = "export", target_os = "macos"))]
+    Exported(crate::export::ExportedRender),
 }
 
 impl RenderBackend {
     /// Process pending render work (`mpv_render_context_update`);
-    /// `true` when a new frame should be drawn.
+    /// `true` when a new frame should be drawn. For the exported backend
+    /// this is a no-op returning `false`: its render context lives on the
+    /// engine's own render thread, which services updates itself.
     pub(crate) fn update(&mut self) -> bool {
         match self {
             RenderBackend::Gl(r) => r.ctx.update(),
             RenderBackend::Sw(r) => r.0.update(),
+            #[cfg(all(feature = "export", target_os = "macos"))]
+            RenderBackend::Exported(_) => false,
         }
     }
 
@@ -131,6 +143,8 @@ impl RenderBackend {
         match self {
             RenderBackend::Gl(_) => RenderKind::OpenGl,
             RenderBackend::Sw(_) => RenderKind::Software,
+            #[cfg(all(feature = "export", target_os = "macos"))]
+            RenderBackend::Exported(_) => RenderKind::Exported,
         }
     }
 }
