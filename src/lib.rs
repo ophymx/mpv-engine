@@ -12,7 +12,9 @@
 //! adapter crate. See README for the seam map and roadmap.
 //!
 //! The playback surface covers what a player UI consumes: transport
-//! (load/pause/seek/stop), the mixer set (volume/mute/speed), typed
+//! (load — immediate, paused, or deferred until a render context
+//! attaches ([`Engine::load_when_ready`]) — pause/seek/stop), the mixer
+//! set (volume/mute/speed), typed
 //! lifecycle events ([`PlaybackEvent`] — including seek-completion for
 //! scrubber snap and end reasons for playlist logic), and push-based
 //! property observation ([`Engine::observe`]) for state that polling

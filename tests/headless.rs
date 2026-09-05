@@ -190,6 +190,111 @@ fn load_paused_holds_until_unpaused() {
     assert!(advanced, "position must advance after unpausing");
 }
 
+/// On an engine whose `vo` never touches the render API, no attach is
+/// coming — `load_when_ready` must degrade to a plain playing `load`
+/// instead of a deferred start that would hold paused forever.
+#[test]
+fn load_when_ready_plays_immediately_without_render_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tone.ogg");
+    if generate_audio(&source).is_none() {
+        return;
+    }
+    let Some(engine) = headless_engine() else {
+        return;
+    };
+    engine.load_when_ready(source.to_str().unwrap()).unwrap();
+    assert!(pump_until(&engine, |ev| matches!(
+        ev,
+        PlaybackEvent::Loaded
+    )));
+    assert!(
+        !engine.is_paused(),
+        "no render attach is coming — playback must start immediately"
+    );
+}
+
+/// The deferred-load policy end-to-end on a render-API engine: the
+/// `loadfile` itself waits for the attach. Loading before the context
+/// exists isn't survivable — mpv can't init the VO, drops the video
+/// track, and a video-only file dies with `MPV_ERROR_NOTHING_TO_PLAY`
+/// (-16) — so the pre-attach window must stay silent (no Failed), and
+/// the attach call must issue the load and reach `Loaded` playing.
+#[test]
+fn load_when_ready_loads_on_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("test.nut");
+    if generate_video(&source).is_none() {
+        return;
+    }
+    let engine = match Engine::video().build() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("skipping: mpv engine unavailable: {e}");
+            return;
+        }
+    };
+    engine.load_when_ready(source.to_str().unwrap()).unwrap();
+
+    // The failure this API exists to prevent lands within ~100ms of an
+    // eager load; give it 500ms to prove nothing was loaded eagerly.
+    for _ in 0..10 {
+        for ev in engine.pump_events() {
+            match ev {
+                PlaybackEvent::Failed { message, .. } => {
+                    panic!("deferred load must not fail pre-attach: {message}")
+                }
+                PlaybackEvent::Loaded => panic!("load must wait for the attach"),
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    engine.attach_sw_render(|| {}).unwrap();
+    let loaded = pump_until(&engine, |ev| match ev {
+        PlaybackEvent::Loaded => true,
+        PlaybackEvent::Failed { message, .. } => {
+            panic!("deferred load failed after attach: {message}")
+        }
+        _ => false,
+    });
+    assert!(loaded, "attach must issue the deferred load");
+    assert!(!engine.is_paused(), "deferred load must come up playing");
+}
+
+/// Pause intent set between `load_when_ready` and the attach carries
+/// into the deferred load: the `pause` property persists across
+/// `loadfile`, so the queued file comes up paused — no policy flag
+/// second-guesses the user.
+#[test]
+fn pause_before_attach_loads_deferred_file_paused() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("test.nut");
+    if generate_video(&source).is_none() {
+        return;
+    }
+    let engine = match Engine::video().build() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("skipping: mpv engine unavailable: {e}");
+            return;
+        }
+    };
+    engine.load_when_ready(source.to_str().unwrap()).unwrap();
+    engine.set_paused(true).unwrap();
+
+    engine.attach_sw_render(|| {}).unwrap();
+    assert!(pump_until(&engine, |ev| matches!(
+        ev,
+        PlaybackEvent::Loaded
+    )));
+    assert!(
+        engine.is_paused(),
+        "pause set before attach must hold through the deferred load"
+    );
+}
+
 /// `stop()` surfaces as `Ended { reason: Stop }` — the distinction
 /// playlist logic needs (user stop must not auto-advance, EOF should).
 #[test]
