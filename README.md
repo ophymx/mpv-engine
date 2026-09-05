@@ -87,12 +87,16 @@ Owned here today:
   platform (on Linux: single-plane `AR24`/`XR24`, linear modifier, so
   Vulkan import needs no modifier negotiation). The `wgpu`
   feature (implies `export`) adds `ExportedFrame::into_wgpu_texture`:
-  the frame wrapped as a `wgpu::Texture` on the shell's device
-  (Metal backend), with the pool buffer returned only when wgpu's own
-  GPU-completion tracking releases the texture — no manual
-  hold-until-completion discipline. Verified by tests that read the
-  texture back through wgpu and compare byte-for-byte with the
-  IOSurface.
+  the frame wrapped as a `wgpu::Texture` on the shell's device — Metal
+  on macOS (IOSurface wrap, pool buffer returned via the hal drop
+  callback) or Vulkan on Linux (wgpu-hal's own dmabuf import; the
+  device opts in with `Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF`, and
+  the pool buffer is retired outright since wgpu's imported memory
+  reference owns the frame from there) — with the frame's memory kept
+  out of mpv's hands until wgpu's own GPU-completion tracking releases
+  the texture: no manual hold-until-completion discipline on either
+  platform. Verified by tests that read the texture back through wgpu
+  and compare byte-for-byte with the exported buffer.
 - An event wakeup seam (`set_wakeup_callback`) so shells get a push
   signal when events queue instead of polling `pump_events` on a timer —
   the only timely path for audio-only use or failures while paused.
@@ -137,15 +141,15 @@ Avoid libepoxy on glvnd builds: it doesn't export core GL symbols as
 
 ## Roadmap (planned non-default features)
 
-The `export` feature has shipped on both platforms — IOSurface on
-macOS, DMA-BUF (GBM + surfaceless EGL, linear layout, `glFinish`
-publish barrier) on Linux — see above. The rows below remain.
+The `export` and `wgpu` features have shipped on both platforms —
+IOSurface → Metal on macOS; DMA-BUF (GBM + surfaceless EGL, linear
+layout, `glFinish` publish barrier) → Vulkan via wgpu-hal's dmabuf
+import on Linux — see above. The rows below remain.
 
 | feature | contents | churn it contains |
 |---|---|---|
 | `egl` | side EGL context + FBO render + RGBA readback (GL-accelerated; the pure-software path is already in core as `render_sw`) | none — stable APIs |
 | `export` (Linux, sync tier) | explicit sync-fd export (`EGL_ANDROID_native_fence_sync`) so the `glFinish` publish barrier can relax into a consumer-side semaphore wait; optional DRM-modifier negotiation as an `ExportOptions` knob | the *permanent* workarounds — e.g. wgpu-hal never enables `VK_KHR_external_semaphore_fd`, so the strict-loader `vkGetSemaphoreFdKHR` path lives here indefinitely |
-| `wgpu` (Linux half) | import `ExportedFrame` → `wgpu::Texture` via wgpu-hal Vulkan (`VK_EXT_external_memory_dma_buf`, linear tiling) — the feature itself has shipped (macOS/Metal path, wgpu 30) and the Vulkan import slots in under the same API | wgpu-major lockstep, isolated behind the non-default feature; releases track wgpu majors (the `egui-wgpu` pattern). On wgpu 30, `create_texture_from_hal`'s `initial_state` and `add_wait_semaphore` replace the older Vulkan-side hacks — internals change, the feature's API doesn't |
 
 The default feature set never grows unstable dependencies: a consumer on
 core + `egl` alone is structurally isolated from all of it.
@@ -166,6 +170,9 @@ render through a real hidden GL context (CGL on macOS, EGL on a DRM
 render node on Linux) and read pixels back through the exported buffer
 (IOSurface / dmabuf mmap) — a session without GPU access (no
 WindowServer, no readable `/dev/dri/renderD*`) skips them the same way.
+`--features wgpu` additionally round-trips frames through a real wgpu
+device (Metal / Vulkan with `VULKAN_EXTERNAL_MEMORY_DMA_BUF`), skipping
+when no capable adapter exists.
 
 ## Invariants for contributors
 

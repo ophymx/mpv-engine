@@ -1,30 +1,81 @@
 //! wgpu import tests: exported frames wrapped as `wgpu::Texture`s on a
-//! real Metal device, verified by reading the texture back through wgpu
-//! itself. Skips like the other suites when mpv, ffmpeg, a GL context,
-//! or a wgpu adapter is unavailable.
-#![cfg(all(feature = "wgpu", target_os = "macos"))]
+//! real device — Metal on macOS, Vulkan on Linux — verified by reading
+//! the texture back through wgpu itself. Skips like the other suites
+//! when mpv, ffmpeg, a GL context, or a suitable wgpu adapter is
+//! unavailable.
+#![cfg(all(feature = "wgpu", any(target_os = "macos", target_os = "linux")))]
 
 mod common;
 
 use common::engine_with_frame;
+use mpv_engine::ExportedFrame;
 
 fn wgpu_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-    descriptor.backends = wgpu::Backends::METAL;
+    #[cfg(target_os = "macos")]
+    {
+        descriptor.backends = wgpu::Backends::METAL;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        descriptor.backends = wgpu::Backends::VULKAN;
+    }
     let instance = wgpu::Instance::new(descriptor);
     let adapter = match pollster::block_on(instance.request_adapter(&Default::default())) {
         Ok(adapter) => adapter,
         Err(e) => {
-            eprintln!("skipping: no wgpu Metal adapter: {e}");
+            eprintln!("skipping: no wgpu adapter for the native backend: {e}");
             return None;
         }
     };
-    match pollster::block_on(adapter.request_device(&Default::default())) {
+    let mut device_descriptor = wgpu::DeviceDescriptor::default();
+    #[cfg(target_os = "linux")]
+    {
+        // The Linux import is behind an explicit wgpu feature opt-in.
+        let needed = wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
+        if !adapter.features().contains(needed) {
+            eprintln!("skipping: adapter lacks VULKAN_EXTERNAL_MEMORY_DMA_BUF");
+            return None;
+        }
+        device_descriptor.required_features = needed;
+    }
+    match pollster::block_on(adapter.request_device(&device_descriptor)) {
         Ok(pair) => Some(pair),
         Err(e) => {
             eprintln!("skipping: wgpu device unavailable: {e}");
             None
         }
+    }
+}
+
+/// Whether the frame's alpha channel is storage-backed. On a Linux
+/// `XR24` frame the fourth byte is undefined through the import, so the
+/// byte-for-byte comparisons mask it out; everywhere else it must match
+/// exactly.
+fn frame_has_alpha(frame: &ExportedFrame) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        const FOURCC_XR24: u32 = 0x3432_5258;
+        frame.fourcc() != FOURCC_XR24
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = frame;
+        true
+    }
+}
+
+fn assert_pixels_match(via_wgpu: &[u8], expected: &[u8], has_alpha: bool, what: &str) {
+    assert_eq!(via_wgpu.len(), expected.len());
+    if has_alpha {
+        assert_eq!(via_wgpu, expected, "{what}");
+    } else {
+        let mask = |px: &[u8]| {
+            let mut px = px.to_vec();
+            px.iter_mut().skip(3).step_by(4).for_each(|a| *a = 0);
+            px
+        };
+        assert_eq!(mask(via_wgpu), mask(expected), "{what} (alpha masked)");
     }
 }
 
@@ -79,14 +130,20 @@ fn imported_texture_matches_frame_pixels() {
         return;
     };
     let expected = frame.copy_pixels();
+    let has_alpha = frame_has_alpha(&frame);
     let texture = frame.into_wgpu_texture(&device).expect("wgpu import");
     assert_eq!(texture.format(), wgpu::TextureFormat::Bgra8Unorm);
     assert_eq!((texture.width(), texture.height()), (64, 64));
 
     let via_wgpu = read_back(&device, &queue, &texture);
-    assert_eq!(via_wgpu.len(), expected.len());
-    // Identical bytes: zero-copy means the texture *is* the IOSurface.
-    assert_eq!(via_wgpu, expected, "wgpu readback differs from IOSurface");
+    // Identical bytes: zero-copy means the texture *is* the exported
+    // buffer (IOSurface / DMA-BUF).
+    assert_pixels_match(
+        &via_wgpu,
+        &expected,
+        has_alpha,
+        "wgpu readback differs from the exported buffer",
+    );
     // And the content sanity from the clip (BGRA, red top / black
     // bottom), so a doubly-wrong path can't pass by agreeing with
     // itself.
@@ -112,12 +169,14 @@ fn texture_outlives_frame_and_detach() {
         return;
     };
     let expected = frame.copy_pixels();
+    let has_alpha = frame_has_alpha(&frame);
     let texture = frame.into_wgpu_texture(&device).expect("wgpu import");
     // The frame is consumed and the engine detached — the texture (and
-    // the IOSurface it retains) must remain fully readable: the drop
-    // callback owns the buffer now, not the pool or the render thread.
+    // the memory it holds: retained IOSurface on macOS, imported dmabuf
+    // reference on Linux) must remain fully readable: wgpu owns the
+    // backing now, not the pool or the render thread.
     engine.detach_render();
     drop(engine);
     let via_wgpu = read_back(&device, &queue, &texture);
-    assert_eq!(via_wgpu, expected);
+    assert_pixels_match(&via_wgpu, &expected, has_alpha, "readback after detach");
 }

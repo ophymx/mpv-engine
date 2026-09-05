@@ -32,6 +32,8 @@ mod macos;
 use macos as platform;
 #[cfg(all(feature = "wgpu", target_os = "macos"))]
 mod wgpu;
+#[cfg(all(feature = "wgpu", target_os = "linux"))]
+mod wgpu_linux;
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -125,8 +127,14 @@ struct PoolState {
     /// Frames currently in the shell's hands.
     in_use: usize,
     /// Buffers alive in total (`free` + `published` + `in_use`) — the
-    /// pool-size cap counts all of them.
+    /// pool-size cap counts all of them. Buffers in `retired` have
+    /// already left the count.
     live: usize,
+    /// Buffers permanently out of the pool (the Linux wgpu import
+    /// consumes them — see [`retire_buffer`]), parked here for the
+    /// render thread to delete their GL/EGL names on its next wake.
+    /// Always empty on macOS.
+    retired: Vec<SurfaceBuffer>,
 }
 
 impl ExportShared {
@@ -266,10 +274,12 @@ fn render_thread(
                 && !shared.update_pending.load(Ordering::SeqCst)
                 && !shared.force_render.load(Ordering::SeqCst)
                 && !shared.swap_pending.load(Ordering::SeqCst)
+                && state.retired.is_empty()
             {
                 shared.cond.wait(&mut state);
             }
         }
+        drain_retired(&shared, &gl);
         if shared.shutdown.load(Ordering::SeqCst) {
             break;
         }
@@ -297,12 +307,27 @@ fn render_thread(
         for mut buffer in state.free.drain(..) {
             buffer.delete_gl(&gl);
         }
+        for mut buffer in state.retired.drain(..) {
+            buffer.delete_gl(&gl);
+        }
         if let Some(mut buffer) = state.published.take() {
             buffer.delete_gl(&gl);
         }
     }
     drop(ctx);
     drop(gl);
+}
+
+/// Delete the GL/EGL names of buffers retired out of the pool by other
+/// threads (see [`retire_buffer`]) and drop them. Render thread only,
+/// GL context current; dropping also closes the buffer's fd — safe,
+/// because a retired buffer's memory is pinned by the importer's own
+/// reference.
+fn drain_retired(shared: &ExportShared, gl: &platform::GlContext) {
+    let retired = std::mem::take(&mut shared.state.lock().retired);
+    for mut buffer in retired {
+        buffer.delete_gl(gl);
+    }
 }
 
 /// Render the current frame into a pool buffer and publish it. Skips
@@ -404,9 +429,11 @@ fn render_one(
 /// reference on the memory, but that only keeps the memory alive; it
 /// does not stop the pool reusing it for pixels.
 ///
-/// With the `wgpu` feature (macOS today), `into_wgpu_texture` removes
-/// that whole obligation: the buffer is returned to the pool only when
-/// wgpu has finished with the imported texture, GPU work included.
+/// With the `wgpu` feature, `into_wgpu_texture` removes that whole
+/// obligation: wgpu's own completion tracking keeps the memory backing
+/// the imported texture out of mpv's hands until wgpu has finished with
+/// it, GPU work included (returned to the pool on macOS, retired from
+/// it on Linux — invisible either way).
 pub struct ExportedFrame {
     buffer: Option<SurfaceBuffer>,
     shared: Arc<ExportShared>,
@@ -521,14 +548,34 @@ impl Drop for ExportedFrame {
 }
 
 /// Return an in-use buffer to the pool: the one bookkeeping path shared
-/// by [`ExportedFrame`]'s drop and the wgpu import's drop callback.
-/// After teardown the buffer just idles in `free` until the shared state
-/// drops with it (GL names died with the context; the surface is
-/// released by `SurfaceBuffer`'s own drop).
+/// by [`ExportedFrame`]'s drop and (on macOS) the wgpu import's drop
+/// callback. After teardown the buffer just idles in `free` until the
+/// shared state drops with it (GL names died with the context; the
+/// backing memory is released by `SurfaceBuffer`'s own drop).
 fn return_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
     let mut state = shared.state.lock();
     state.in_use -= 1;
     state.free.push(buffer);
+}
+
+/// Permanently retire an in-use buffer from the pool — the Linux wgpu
+/// import's counterpart to [`return_buffer`]: the dmabuf's memory now
+/// backs a wgpu texture that wgpu releases on its own completion
+/// schedule, so mpv must never render into that memory again (the same
+/// aliasing hazard the macOS drop callback prevents, solved by
+/// consumption instead of reuse). Shrinking `live` lets the render
+/// thread allocate a replacement; the buffer parks in `retired` until
+/// the render thread deletes its GL/EGL names and closes our fd — the
+/// importer holds its own duplicate.
+#[cfg(all(feature = "wgpu", target_os = "linux"))]
+fn retire_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
+    {
+        let mut state = shared.state.lock();
+        state.in_use -= 1;
+        state.live -= 1;
+        state.retired.push(buffer);
+    }
+    shared.notify();
 }
 
 impl std::fmt::Debug for ExportedFrame {

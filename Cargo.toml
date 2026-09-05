@@ -27,7 +27,7 @@ categories = ["multimedia::video"]
 # compiles to nothing.
 export = []
 # Zero-copy import of ExportedFrame into wgpu (implies `export`; macOS →
-# Metal today, the Linux → Vulkan half is roadmap).
+# Metal, Linux → Vulkan via wgpu-hal's own dmabuf import).
 # Non-default and wgpu-major-locked on purpose — releases carrying it
 # track wgpu majors (the egui-wgpu pattern, see README), so core-only
 # consumers never feel that churn. Needs Rust 1.87 (wgpu's MSRV).
@@ -50,13 +50,20 @@ rsmpv = { version = "0.2", features = ["render"] }
 parking_lot = "0.12"
 thiserror = "2"
 tracing = "0.1"
-wgpu = { version = "30", default-features = false, features = ["metal"], optional = true }
-wgpu-hal = { version = "30", default-features = false, features = ["metal"], optional = true }
+
+# wgpu with only the platform's native backend enabled: Vulkan on Linux,
+# whose wgpu-hal carries the dmabuf import the Linux `wgpu` feature
+# rides on (the Metal twin lives in the macOS section below).
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["vulkan"], optional = true }
+wgpu-hal = { version = "30", default-features = false, features = ["vulkan"], optional = true }
 
 # The objc2 trio exists only to wrap an IOSurface in an MTLTexture on the
 # consumer's device — the same generation of bindings wgpu-hal's Metal
 # backend itself uses, so no second ObjC binding family enters the tree.
 [target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["metal"], optional = true }
+wgpu-hal = { version = "30", default-features = false, features = ["metal"], optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-metal = { version = "0.3.2", optional = true, features = [
     "MTLAllocation",

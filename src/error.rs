@@ -32,8 +32,10 @@ pub enum Error {
     /// feature,
     /// [`ExportedFrame::into_wgpu_texture`](crate::ExportedFrame::into_wgpu_texture))
     /// — the device isn't on the platform's native backend (Metal on
-    /// macOS), or the driver refused the IOSurface wrap.
-    #[cfg(all(feature = "wgpu", target_os = "macos"))]
+    /// macOS, Vulkan on Linux), lacks a required wgpu feature
+    /// (`VULKAN_EXTERNAL_MEMORY_DMA_BUF` on Linux), or the driver
+    /// refused the IOSurface wrap / DMA-BUF import.
+    #[cfg(all(feature = "wgpu", any(target_os = "macos", target_os = "linux")))]
     #[error("wgpu import: {0}")]
     WgpuImport(String),
     /// A call that needs a live render context ran before any attach.

@@ -43,10 +43,11 @@
 //! zero-copy exportable frames (`ExportedFrame` — IOSurface-backed on
 //! macOS, DMA-BUF-backed on Linux) for Metal / Vulkan / wgpu import —
 //! no GL and no pixel copies in the shell. The `wgpu` feature (implies
-//! `export`, wgpu-major-locked, macOS today) adds
+//! `export`, wgpu-major-locked) adds
 //! `ExportedFrame::into_wgpu_texture`,
-//! which wraps the frame as a `wgpu::Texture` on the shell's device and
-//! ties the pool buffer's return to wgpu's own GPU-completion tracking.
+//! which wraps the frame as a `wgpu::Texture` on the shell's device
+//! (Metal on macOS, Vulkan on Linux) and leaves the frame's memory in
+//! wgpu's own GPU-completion tracking — no manual hold-until-done.
 //! Event delivery is pull-based
 //! ([`Engine::pump_events`]) with an optional push signal
 //! ([`Engine::set_wakeup_callback`]) for shells that don't want a
