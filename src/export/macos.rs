@@ -193,6 +193,15 @@ impl GlContext {
         }
         Ok(())
     }
+
+    /// Publish barrier before an IOSurface is sampled from another API:
+    /// IOSurface guarantees cross-API coherency only once the producing
+    /// GL context flushes (a full `glFinish` stall is *not* required —
+    /// don't "strengthen" this; the Linux backend finishes for DMA-BUF
+    /// reasons of its own).
+    pub(crate) fn publish_barrier(&self) {
+        unsafe { glFlush() };
+    }
 }
 
 impl Drop for GlContext {
@@ -227,8 +236,9 @@ unsafe impl Sync for SurfaceBuffer {}
 
 impl SurfaceBuffer {
     /// Create a `width`×`height` buffer. Render thread only, GL context
-    /// current.
-    pub(crate) fn new(width: u32, height: u32) -> Result<Self> {
+    /// current (`_gl` is the cross-platform signature; CGL resolves the
+    /// current context itself).
+    pub(crate) fn new(_gl: &GlContext, width: u32, height: u32) -> Result<Self> {
         let surface = create_iosurface(width, height)?;
         let cgl = unsafe { CGLGetCurrentContext() };
         let mut texture: u32 = 0;
@@ -324,7 +334,7 @@ impl SurfaceBuffer {
     /// context current; the IOSurface itself is released by `Drop` (any
     /// thread). Buffers retired anywhere else simply skip this — their
     /// GL names die with the render thread's context.
-    pub(crate) fn delete_gl(&mut self) {
+    pub(crate) fn delete_gl(&mut self, _gl: &GlContext) {
         unsafe {
             if self.fbo != 0 {
                 glDeleteFramebuffers(1, &self.fbo);
@@ -441,12 +451,4 @@ pub(crate) fn gl_proc_address(name: &str) -> *mut c_void {
         return std::ptr::null_mut();
     };
     unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) }
-}
-
-/// Publish barrier before an IOSurface is sampled from another API:
-/// IOSurface guarantees cross-API coherency only once the producing GL
-/// context flushes (a full `glFinish` stall is *not* required — don't
-/// "strengthen" this).
-pub(crate) fn flush() {
-    unsafe { glFlush() };
 }

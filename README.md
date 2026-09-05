@@ -72,15 +72,20 @@ Owned here today:
   (`RenderKind`), so shells routing between per-backend paths (GPU
   texture sampling vs. RGBA upload) don't track the attach outcome in
   state of their own.
-- An exported-frame backend on macOS (non-default `export` feature):
-  `attach_exported_render` spawns an engine-owned render thread with a
-  hidden CGL context, mpv renders into IOSurface-backed framebuffers
-  there, and the shell pulls zero-copy `ExportedFrame` handles
-  (`acquire_frame`) to import into Metal/wgpu — the consumer-side answer
+- An exported-frame backend on macOS and Linux (non-default `export`
+  feature): `attach_exported_render` spawns an engine-owned render
+  thread with a hidden GL context (CGL on macOS; surfaceless EGL over a
+  DRM render node on Linux — no display server involved), mpv renders
+  into exportable framebuffers there (IOSurface-backed / DMA-BUF-backed),
+  and the shell pulls zero-copy `ExportedFrame` handles
+  (`acquire_frame`) to import into Metal / Vulkan / wgpu — the
+  consumer-side answer
   to libmpv's GL-or-software render API, with no GL and no pixel copies
   in the shell. Fully safe API (the GL-currency contract never crosses
   it), newest-wins frame pool, live resizing (`set_export_size`), and
-  BGRA8 row-0-at-top output pinned by an orientation test. The `wgpu`
+  BGRA8 row-0-at-top output pinned by an orientation test on each
+  platform (on Linux: single-plane `AR24`/`XR24`, linear modifier, so
+  Vulkan import needs no modifier negotiation). The `wgpu`
   feature (implies `export`) adds `ExportedFrame::into_wgpu_texture`:
   the frame wrapped as a `wgpu::Texture` on the shell's device
   (Metal backend), with the pool buffer returned only when wgpu's own
@@ -132,14 +137,15 @@ Avoid libepoxy on glvnd builds: it doesn't export core GL symbols as
 
 ## Roadmap (planned non-default features)
 
-The macOS half of the export story has shipped as the `export` feature
-(IOSurface — see above); the rows below are the Linux/Vulkan analog.
+The `export` feature has shipped on both platforms — IOSurface on
+macOS, DMA-BUF (GBM + surfaceless EGL, linear layout, `glFinish`
+publish barrier) on Linux — see above. The rows below remain.
 
 | feature | contents | churn it contains |
 |---|---|---|
 | `egl` | side EGL context + FBO render + RGBA readback (GL-accelerated; the pure-software path is already in core as `render_sw`) | none — stable APIs |
-| `export` (Linux) | `ExportedFrame`: OPAQUE_FD/DMA-BUF + GL semaphore export (ash only) | the *permanent* workarounds — e.g. wgpu-hal never enables `VK_KHR_external_semaphore_fd`, so the strict-loader `vkGetSemaphoreFdKHR` path lives here indefinitely |
-| `wgpu` (Linux half) | import `ExportedFrame` → `wgpu::Texture` via wgpu-hal Vulkan — the feature itself has shipped (macOS/Metal path, wgpu 30) and the Vulkan import slots in under the same API | wgpu-major lockstep, isolated behind the non-default feature; releases track wgpu majors (the `egui-wgpu` pattern). On wgpu 30, `create_texture_from_hal`'s `initial_state` and `add_wait_semaphore` replace the older Vulkan-side hacks — internals change, the feature's API doesn't |
+| `export` (Linux, sync tier) | explicit sync-fd export (`EGL_ANDROID_native_fence_sync`) so the `glFinish` publish barrier can relax into a consumer-side semaphore wait; optional DRM-modifier negotiation as an `ExportOptions` knob | the *permanent* workarounds — e.g. wgpu-hal never enables `VK_KHR_external_semaphore_fd`, so the strict-loader `vkGetSemaphoreFdKHR` path lives here indefinitely |
+| `wgpu` (Linux half) | import `ExportedFrame` → `wgpu::Texture` via wgpu-hal Vulkan (`VK_EXT_external_memory_dma_buf`, linear tiling) — the feature itself has shipped (macOS/Metal path, wgpu 30) and the Vulkan import slots in under the same API | wgpu-major lockstep, isolated behind the non-default feature; releases track wgpu majors (the `egui-wgpu` pattern). On wgpu 30, `create_texture_from_hal`'s `initial_state` and `add_wait_semaphore` replace the older Vulkan-side hacks — internals change, the feature's API doesn't |
 
 The default feature set never grows unstable dependencies: a consumer on
 core + `egl` alone is structurally isolated from all of it.
@@ -153,11 +159,13 @@ adapter crate — those items fail the interface-survival rule.
 `cargo test` runs headless against real libmpv (`vo=null`); media inputs
 are generated with ffmpeg. Both are probed at runtime — missing tooling
 skips tests rather than failing them. System deps: the libmpv dev
-package to build, ffmpeg to generate test inputs. With
-`--features export` on macOS, the exported-backend tests additionally
-render through a real hidden CGL context and read pixels back through
-the IOSurface — a session without WindowServer/GPU access skips them the
-same way.
+package to build, ffmpeg to generate test inputs; on Linux the `export`
+feature additionally links libEGL and libgbm (their dev packages at
+build time). With `--features export`, the exported-backend tests
+render through a real hidden GL context (CGL on macOS, EGL on a DRM
+render node on Linux) and read pixels back through the exported buffer
+(IOSurface / dmabuf mmap) — a session without GPU access (no
+WindowServer, no readable `/dev/dri/renderD*`) skips them the same way.
 
 ## Invariants for contributors
 

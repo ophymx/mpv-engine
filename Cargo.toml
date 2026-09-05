@@ -17,16 +17,17 @@ categories = ["multimedia::video"]
 # README "Roadmap".
 
 [features]
-# Exported-frame render backend (macOS today): the engine owns a hidden
-# CGL context on a dedicated render thread, renders into IOSurface-backed
-# framebuffers, and hands the shell zero-copy frame handles for Metal /
-# wgpu import. Links the OpenGL, IOSurface and CoreFoundation frameworks
-# directly — no new Rust dependencies, per the policy above. On other
-# platforms the feature currently compiles to nothing (the Linux DMA-BUF
-# analog is roadmap).
+# Exported-frame render backend (macOS + Linux): the engine owns a hidden
+# GL context on a dedicated render thread (CGL / surfaceless EGL over a
+# DRM render node), renders into exportable framebuffers (IOSurface /
+# DMA-BUF), and hands the shell zero-copy frame handles for Metal /
+# Vulkan / wgpu import. Links the OpenGL, IOSurface and CoreFoundation
+# frameworks (macOS) or libEGL and libgbm (Linux) directly — no new Rust
+# dependencies, per the policy above. On other platforms the feature
+# compiles to nothing.
 export = []
 # Zero-copy import of ExportedFrame into wgpu (implies `export`; macOS →
-# Metal today, the Linux → Vulkan half lands with the DMA-BUF tier).
+# Metal today, the Linux → Vulkan half is roadmap).
 # Non-default and wgpu-major-locked on purpose — releases carrying it
 # track wgpu majors (the egui-wgpu pattern, see README), so core-only
 # consumers never feel that churn. Needs Rust 1.87 (wgpu's MSRV).

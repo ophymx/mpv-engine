@@ -37,12 +37,14 @@
 //! until the frame's target time (right for a toolkit paint handler,
 //! wrong on a compositor thread), and mpv's advanced control (which
 //! obligates [`Engine::render_update`] after every update callback).
-//! On macOS the non-default `export` feature adds a third, fully safe
-//! backend (`Engine::attach_exported_render`): the engine renders on a
-//! hidden GL context of its own and hands the shell zero-copy
-//! IOSurface-backed frames (`ExportedFrame`) for Metal/wgpu import — no
-//! GL and no pixel copies in the shell. The `wgpu` feature (implies
-//! `export`, wgpu-major-locked) adds `ExportedFrame::into_wgpu_texture`,
+//! On macOS and Linux the non-default `export` feature adds a third,
+//! fully safe backend (`Engine::attach_exported_render`): the engine
+//! renders on a hidden GL context of its own and hands the shell
+//! zero-copy exportable frames (`ExportedFrame` — IOSurface-backed on
+//! macOS, DMA-BUF-backed on Linux) for Metal / Vulkan / wgpu import —
+//! no GL and no pixel copies in the shell. The `wgpu` feature (implies
+//! `export`, wgpu-major-locked, macOS today) adds
+//! `ExportedFrame::into_wgpu_texture`,
 //! which wraps the frame as a `wgpu::Texture` on the shell's device and
 //! ties the pool buffer's return to wgpu's own GPU-completion tracking.
 //! Event delivery is pull-based
@@ -76,7 +78,7 @@
 
 mod engine;
 mod error;
-#[cfg(all(feature = "export", target_os = "macos"))]
+#[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
 mod export;
 mod render;
 
@@ -85,6 +87,6 @@ pub use engine::{
     PropertyValue,
 };
 pub use error::{Error, Result};
-#[cfg(all(feature = "export", target_os = "macos"))]
+#[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
 pub use export::{ExportOptions, ExportedFrame};
 pub use render::{GlRenderOptions, ProcAddressFn, RenderKind};

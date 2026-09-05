@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use rsmpv::{EndFileReason, Event, Format, Mpv, PropertyData, sys};
 
 use crate::error::{Error, Result, describe_code};
-#[cfg(all(feature = "export", target_os = "macos"))]
+#[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
 use crate::export::{ExportOptions, ExportedFrame, ExportedRender};
 use crate::render::{
     GlRender, GlRenderOptions, ProcAddressFn, RenderBackend, RenderKind, SwRender,
@@ -1033,9 +1033,10 @@ impl Engine {
 
     /// Create the exported-frame render backend (`export` feature): the
     /// engine spawns a render thread owning a hidden GL context, mpv
-    /// renders there into IOSurface-backed framebuffers, and the shell
-    /// pulls zero-copy [`ExportedFrame`]s with
-    /// [`acquire_frame`](Self::acquire_frame) to import into Metal/wgpu.
+    /// renders there into exportable framebuffers (IOSurface-backed on
+    /// macOS, DMA-BUF-backed on Linux), and the shell pulls zero-copy
+    /// [`ExportedFrame`]s with [`acquire_frame`](Self::acquire_frame) to
+    /// import into Metal / Vulkan / wgpu.
     /// Fully safe — no GL context or currency contract crosses this API;
     /// the thread that creates the context is the thread that renders on
     /// it and frees it.
@@ -1057,9 +1058,10 @@ impl Engine {
     /// queue, with the same failure routing as the other attach methods.
     ///
     /// Errors with [`Error::ExportSetup`] when no GL context can be
-    /// created — typically a session without WindowServer/GPU access;
+    /// created — typically a session without GPU access (no
+    /// WindowServer on macOS, no readable DRM render node on Linux);
     /// treat it like a missing display.
-    #[cfg(all(feature = "export", target_os = "macos"))]
+    #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
     pub fn attach_exported_render(
         &self,
         options: ExportOptions,
@@ -1080,7 +1082,7 @@ impl Engine {
             }
         };
         *self.render.lock() = Some(RenderBackend::Exported(render));
-        tracing::debug!("mpv exported (IOSurface) render context attached");
+        tracing::debug!("mpv exported render context attached");
         self.drain_pending_load();
         Ok(())
     }
@@ -1092,7 +1094,7 @@ impl Engine {
     /// [`Error::RenderBackendMismatch`] when a different backend is
     /// attached. Callable from any thread, including from inside the
     /// exported backend's `on_update`.
-    #[cfg(all(feature = "export", target_os = "macos"))]
+    #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
     pub fn acquire_frame(&self) -> Result<Option<ExportedFrame>> {
         // Clone the shared state out under a short slot lock; the take
         // itself must not hold the render lock (an attach/detach could
@@ -1113,7 +1115,7 @@ impl Engine {
     /// No-op `Ok` when nothing is attached;
     /// [`Error::RenderBackendMismatch`] for a different backend.
     /// Outstanding [`ExportedFrame`]s keep their original size.
-    #[cfg(all(feature = "export", target_os = "macos"))]
+    #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
     pub fn set_export_size(&self, width: u32, height: u32) -> Result<()> {
         match self.render.lock().as_ref() {
             Some(RenderBackend::Exported(r)) => {

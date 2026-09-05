@@ -18,12 +18,14 @@ pub enum Error {
     #[error("render call does not match the attached render backend")]
     RenderBackendMismatch,
     /// Setting up the exported-frame backend's hidden GL context or its
-    /// IOSurface-backed framebuffers failed (`export` feature,
+    /// exportable framebuffers (IOSurface / DMA-BUF) failed (`export`
+    /// feature,
     /// [`Engine::attach_exported_render`](crate::Engine::attach_exported_render)).
-    /// The common non-bug cause is a session without WindowServer/GPU
-    /// access (SSH, bare CI) — treat it like a missing display and fall
-    /// back to another backend or skip.
-    #[cfg(all(feature = "export", target_os = "macos"))]
+    /// The common non-bug cause is a session without GPU access —
+    /// no WindowServer on macOS, no readable DRM render node on Linux
+    /// (SSH, bare CI, missing render/video group) — treat it like a
+    /// missing display and fall back to another backend or skip.
+    #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
     #[error("exported render setup: {0}")]
     ExportSetup(String),
     /// Importing an exported frame into a wgpu device failed (`wgpu`

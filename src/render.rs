@@ -121,7 +121,7 @@ pub enum RenderKind {
 pub(crate) enum RenderBackend {
     Gl(GlRender),
     Sw(SwRender),
-    #[cfg(all(feature = "export", target_os = "macos"))]
+    #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
     Exported(crate::export::ExportedRender),
 }
 
@@ -134,7 +134,7 @@ impl RenderBackend {
         match self {
             RenderBackend::Gl(r) => r.ctx.update(),
             RenderBackend::Sw(r) => r.0.update(),
-            #[cfg(all(feature = "export", target_os = "macos"))]
+            #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
             RenderBackend::Exported(_) => false,
         }
     }
@@ -143,7 +143,7 @@ impl RenderBackend {
         match self {
             RenderBackend::Gl(_) => RenderKind::OpenGl,
             RenderBackend::Sw(_) => RenderKind::Software,
-            #[cfg(all(feature = "export", target_os = "macos"))]
+            #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
             RenderBackend::Exported(_) => RenderKind::Exported,
         }
     }

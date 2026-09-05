@@ -1,26 +1,36 @@
-//! Exported-frame render backend (`export` feature, macOS): the engine
-//! owns a hidden CGL context on a dedicated render thread, mpv renders
-//! into IOSurface-backed framebuffers there, and the shell receives
-//! zero-copy [`ExportedFrame`] handles it imports into Metal (or wgpu)
-//! directly — no pixel ever crosses the CPU, and no GL leaks into the
-//! shell.
+//! Exported-frame render backend (`export` feature, macOS + Linux): the
+//! engine owns a hidden GL context on a dedicated render thread — CGL
+//! on macOS, surfaceless EGL over a DRM render node on Linux — mpv
+//! renders into exportable framebuffers there (IOSurface-backed /
+//! DMA-BUF-backed), and the shell receives zero-copy [`ExportedFrame`]
+//! handles it imports into Metal / Vulkan (or wgpu) directly — no pixel
+//! ever crosses the CPU, and no GL leaks into the shell.
 //!
 //! Why this shape: libmpv's render API speaks only OpenGL and software,
 //! and mpv never inspects what memory backs the FBO it is handed — so
-//! the consumer-side fix for "no Metal render API" is to make the FBO's
-//! color attachment *born exportable* (an IOSurface) and hand the handle
-//! across. The GL involvement is confined to this module's thread; the
-//! shell's compositor never touches it.
+//! the consumer-side fix for "no Metal/Vulkan render API" is to make the
+//! FBO's color attachment *born exportable* (an IOSurface / a DMA-BUF)
+//! and hand the handle across. The GL involvement is confined to this
+//! module's thread; the shell's compositor never touches it.
 //!
 //! Pool discipline: a small ring of buffers (default 3) rotates through
 //! free → rendering → published → in-use(shell) → free. mpv renders into
-//! a free buffer, `glFlush` publishes it (IOSurface's cross-API
-//! coherency barrier), and the newest published frame replaces an
-//! unconsumed older one — the shell always acquires the latest frame.
-//! While the shell holds every buffer, frames are dropped, not queued.
+//! a free buffer, the platform's publish barrier makes it coherent for
+//! other APIs (`glFlush` under IOSurface's coherency contract on macOS,
+//! `glFinish` on Linux — see each platform module), and the newest
+//! published frame replaces an unconsumed older one — the shell always
+//! acquires the latest frame. While the shell holds every buffer,
+//! frames are dropped, not queued.
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
 mod macos;
-#[cfg(feature = "wgpu")]
+#[cfg(target_os = "macos")]
+use macos as platform;
+#[cfg(all(feature = "wgpu", target_os = "macos"))]
 mod wgpu;
 
 use std::ffi::c_void;
@@ -33,7 +43,7 @@ use rsmpv::Mpv;
 use rsmpv::render::{OpenGlFbo, OwnedRenderContext};
 
 use crate::error::{Error, Result};
-use macos::SurfaceBuffer;
+use platform::SurfaceBuffer;
 
 /// Attach-time configuration for
 /// [`Engine::attach_exported_render`](crate::Engine::attach_exported_render).
@@ -201,17 +211,17 @@ impl Drop for ExportedRender {
     }
 }
 
-/// The render thread: owns the CGL context and the mpv render context
-/// for their whole lives, so GL-currency is a per-thread invariant here
-/// rather than a caller obligation — this is what lets the public attach
-/// be a safe fn.
+/// The render thread: owns the hidden GL context (CGL / EGL) and the
+/// mpv render context for their whole lives, so GL-currency is a
+/// per-thread invariant here rather than a caller obligation — this is
+/// what lets the public attach be a safe fn.
 fn render_thread(
     core: Arc<Mpv>,
     shared: Arc<ExportShared>,
     relay: Box<dyn Fn() + Send + Sync>,
     init_tx: std::sync::mpsc::Sender<Result<()>>,
 ) {
-    let gl = match macos::GlContext::new() {
+    let gl = match platform::GlContext::new() {
         Ok(gl) => gl,
         Err(e) => {
             let _ = init_tx.send(Err(e));
@@ -225,7 +235,7 @@ fn render_thread(
     // Advanced control on: this thread services `update()` promptly after
     // every callback by construction, and mpv gets direct rendering.
     let proc_address: Box<dyn FnMut(&str) -> *mut c_void + Send + 'static> =
-        Box::new(macos::gl_proc_address);
+        Box::new(platform::gl_proc_address);
     // SAFETY: the GL context above is current on this thread now and for
     // every later call — context and renderer live and die on this one
     // thread, with the renderer dropped first (declaration order below is
@@ -272,22 +282,23 @@ fn render_thread(
         // also gates rendering to real new-frame updates.
         let wants_frame = updated && ctx.update();
         if wants_frame || force {
-            render_one(&mut ctx, &shared, &relay);
+            render_one(&mut ctx, &gl, &shared, &relay);
         }
     }
 
     // Teardown, still on this thread with the GL context current: pooled
     // buffers' GL names first, then the render context (the crate's
     // free-with-context-current contract), then the context itself.
-    // Frames still in the shell's hands keep their IOSurfaces alive on
-    // their own; their GL names die with the context.
+    // Frames still in the shell's hands keep their backing memory alive
+    // on their own (retained IOSurface / dmabuf fd); their GL names die
+    // with the context.
     {
         let mut state = shared.state.lock();
         for mut buffer in state.free.drain(..) {
-            buffer.delete_gl();
+            buffer.delete_gl(&gl);
         }
         if let Some(mut buffer) = state.published.take() {
-            buffer.delete_gl();
+            buffer.delete_gl(&gl);
         }
     }
     drop(ctx);
@@ -296,7 +307,12 @@ fn render_thread(
 
 /// Render the current frame into a pool buffer and publish it. Skips
 /// (dropping the frame) when the shell is holding every buffer.
-fn render_one(ctx: &mut OwnedRenderContext, shared: &Arc<ExportShared>, relay: &dyn Fn()) {
+fn render_one(
+    ctx: &mut OwnedRenderContext,
+    gl: &platform::GlContext,
+    shared: &Arc<ExportShared>,
+    relay: &dyn Fn(),
+) {
     let (width, height) = unpack_size(shared.target_size.load(Ordering::SeqCst));
     if width == 0 || height == 0 {
         return;
@@ -310,7 +326,7 @@ fn render_one(ctx: &mut OwnedRenderContext, shared: &Arc<ExportShared>, relay: &
             if buffer.size() == (width, height) {
                 kept.push(buffer);
             } else {
-                buffer.delete_gl();
+                buffer.delete_gl(gl);
                 state.live -= 1;
             }
         }
@@ -321,13 +337,13 @@ fn render_one(ctx: &mut OwnedRenderContext, shared: &Arc<ExportShared>, relay: &
             // Steal an unconsumed published frame before growing: the
             // shell skipped it, and newest-wins is the display policy.
             if let Some(mut stale) = state.published.take_if(|b| b.size() != (width, height)) {
-                stale.delete_gl();
+                stale.delete_gl(gl);
                 state.live -= 1;
             }
             if let Some(buffer) = state.published.take() {
                 Some(buffer)
             } else if state.live < shared.pool_size {
-                match SurfaceBuffer::new(width, height) {
+                match SurfaceBuffer::new(gl, width, height) {
                     Ok(buffer) => {
                         state.live += 1;
                         Some(buffer)
@@ -351,19 +367,19 @@ fn render_one(ctx: &mut OwnedRenderContext, shared: &Arc<ExportShared>, relay: &
         fbo: buffer.fbo() as i32,
         width: width as i32,
         height: height as i32,
-        internal_format: macos::FBO_INTERNAL_FORMAT,
+        internal_format: platform::FBO_INTERNAL_FORMAT,
     };
     // No flip: mpv's unflipped FBO output already puts row 0 at the top
-    // of the image (pinned by the orientation integration test), which
-    // is the layout Metal/CoreVideo consumers read; flip_y is for
-    // GL-convention targets. Block-for-target-time is mpv's own pacing,
-    // harmless on this dedicated thread.
+    // of the image (pinned by the orientation integration tests on both
+    // platforms), which is the layout Metal/CoreVideo/Vulkan consumers
+    // read; flip_y is for GL-convention targets. Block-for-target-time
+    // is mpv's own pacing, harmless on this dedicated thread.
     if let Err(e) = ctx.render_opengl(fbo, false, true) {
         tracing::warn!("export render failed: {e}");
         shared.state.lock().free.push(buffer);
         return;
     }
-    macos::flush();
+    gl.publish_barrier();
     {
         let mut state = shared.state.lock();
         if let Some(previous) = state.published.replace(buffer) {
@@ -373,22 +389,24 @@ fn render_one(ctx: &mut OwnedRenderContext, shared: &Arc<ExportShared>, relay: &
     relay();
 }
 
-/// One rendered video frame, wrapping a retained IOSurface the engine's
-/// hidden GL context rendered into — acquired with
+/// One rendered video frame, wrapping the exportable buffer the
+/// engine's hidden GL context rendered into — a retained IOSurface on
+/// macOS, a DMA-BUF on Linux. Acquired with
 /// [`Engine::acquire_frame`](crate::Engine::acquire_frame), imported
-/// into the shell's GPU API via [`io_surface`](Self::io_surface).
+/// into the shell's GPU API via the platform handle (`io_surface` on
+/// macOS, `dma_buf_fd` on Linux).
 ///
 /// Dropping the frame returns its buffer to the render pool, after which
-/// **mpv will render future frames into the same IOSurface** — hold the
+/// **mpv will render future frames into the same memory** — hold the
 /// frame until the GPU work sampling it has completed (e.g. until the
-/// command buffer's completion handler), not merely until it was
-/// encoded. Creating a Metal texture from the surface retains the
-/// surface itself, but retention only keeps the memory alive; it does
-/// not stop the pool reusing it for pixels.
+/// command buffer's completion handler / fence), not merely until it
+/// was encoded. Importing the handle into Metal or Vulkan takes its own
+/// reference on the memory, but that only keeps the memory alive; it
+/// does not stop the pool reusing it for pixels.
 ///
-/// With the `wgpu` feature, `into_wgpu_texture` removes that whole
-/// obligation: the buffer is returned to the pool only when wgpu has
-/// finished with the imported texture, GPU work included.
+/// With the `wgpu` feature (macOS today), `into_wgpu_texture` removes
+/// that whole obligation: the buffer is returned to the pool only when
+/// wgpu has finished with the imported texture, GPU work included.
 pub struct ExportedFrame {
     buffer: Option<SurfaceBuffer>,
     shared: Arc<ExportShared>,
@@ -416,8 +434,50 @@ impl ExportedFrame {
     /// alive (see the type docs for the reuse hazard after drop). Pass it
     /// to `MTLDevice newTextureWithDescriptor:iosurface:plane:` (pixel
     /// format `bgra8Unorm`, plane 0) or your interop layer's equivalent.
+    #[cfg(target_os = "macos")]
     pub fn io_surface(&self) -> *mut c_void {
         self.buffer().io_surface()
+    }
+
+    /// The frame's DMA-BUF fd, valid while this frame is alive (see the
+    /// type docs for the reuse hazard after drop). A single-plane
+    /// [`fourcc`](Self::fourcc) buffer with [`modifier`](Self::modifier)
+    /// `DRM_FORMAT_MOD_LINEAR`, [`stride`](Self::stride) bytes per row,
+    /// plane offset 0.
+    ///
+    /// Import it into Vulkan via `VK_EXT_external_memory_dma_buf`
+    /// (`VK_FORMAT_B8G8R8A8_UNORM`, `VK_IMAGE_TILING_LINEAR`), into EGL
+    /// via `EGL_EXT_image_dma_buf_import`, or across a compositor
+    /// protocol — anything that speaks dmabuf. APIs that take fd
+    /// *ownership* (Vulkan import does) must be handed a duplicate
+    /// (`try_clone_to_owned`), never this fd.
+    #[cfg(target_os = "linux")]
+    pub fn dma_buf_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.buffer().dma_buf_fd()
+    }
+
+    /// Bytes per row of the DMA-BUF's single plane (≥ `width * 4`).
+    #[cfg(target_os = "linux")]
+    pub fn stride(&self) -> u32 {
+        self.buffer().stride()
+    }
+
+    /// The buffer's DRM fourcc: `DRM_FORMAT_ARGB8888` (`'AR24'`) — or
+    /// `DRM_FORMAT_XRGB8888` (`'XR24'`) on drivers that couldn't render
+    /// to the former, in which case the alpha byte is meaningless. Both
+    /// are little-endian B,G,R,A/X bytes: `VK_FORMAT_B8G8R8A8_UNORM` /
+    /// wgpu `Bgra8Unorm`.
+    #[cfg(target_os = "linux")]
+    pub fn fourcc(&self) -> u32 {
+        self.buffer().fourcc()
+    }
+
+    /// The buffer's DRM format modifier — always
+    /// `DRM_FORMAT_MOD_LINEAR` (0) with this backend, exposed so import
+    /// code can pass it through instead of hardcoding.
+    #[cfg(target_os = "linux")]
+    pub fn modifier(&self) -> u64 {
+        platform::MODIFIER_LINEAR
     }
 
     /// Frame width in pixels.
@@ -432,8 +492,8 @@ impl ExportedFrame {
 
     /// Copy the pixels out as tightly packed BGRA8 rows, row 0 at the
     /// top. This is a CPU readback — for screenshots, thumbnails, and
-    /// tests, not the per-frame display path (that's what
-    /// [`io_surface`](Self::io_surface) avoids).
+    /// tests, not the per-frame display path (that's what the zero-copy
+    /// platform handle avoids).
     pub fn copy_pixels(&self) -> Vec<u8> {
         self.buffer().copy_pixels()
     }
