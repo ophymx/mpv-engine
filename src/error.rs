@@ -17,6 +17,12 @@ pub enum Error {
     /// shell, surfaced loudly rather than silently dropped.
     #[error("render call does not match the attached render backend")]
     RenderBackendMismatch,
+    /// A call that needs a live render context ran before any attach —
+    /// e.g. registering a render-update callback that could never fire.
+    /// Like [`RenderBackendMismatch`](Self::RenderBackendMismatch), a
+    /// wiring bug surfaced loudly rather than silently dropped.
+    #[error("no render context is attached")]
+    NotAttached,
 }
 
 /// Shorthand for results carrying this crate's [`enum@Error`].

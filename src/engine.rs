@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use rsmpv::{EndFileReason, Event, Format, Mpv, PropertyData, sys};
 
 use crate::error::{Error, Result, describe_code};
-use crate::render::{GlRender, GlRenderOptions, ProcAddressFn, RenderBackend, SwRender};
+use crate::render::{GlRender, GlRenderOptions, ProcAddressFn, RenderBackend, RenderKind, SwRender};
 
 /// Force `LC_NUMERIC=C` exactly once before the first `mpv_create`. mpv
 /// refuses to work under a comma-decimal locale (its option/number parsing
@@ -835,6 +835,55 @@ impl Engine {
     /// Whether a render context (of either backend) is currently attached.
     pub fn has_render(&self) -> bool {
         self.render.lock().is_some()
+    }
+
+    /// Which render backend is attached, if any — the "which one"
+    /// companion to [`has_render`](Self::has_render), for shells that
+    /// route between per-backend code paths (say, GPU texture sampling
+    /// vs. RGBA upload) without having to track the attach outcome in
+    /// state of their own.
+    pub fn attached_render(&self) -> Option<RenderKind> {
+        self.render.lock().as_ref().map(RenderBackend::kind)
+    }
+
+    /// Replace the render-update callback registered at attach — the same
+    /// post-registration replaceability
+    /// [`set_wakeup_callback`](Self::set_wakeup_callback) has, for the
+    /// render seam. For shells that can only build their real closure
+    /// after the engine is shared: attach with a placeholder, wrap the
+    /// engine in your `Arc`/shared structure, then register the
+    /// weak-capturing closure here.
+    ///
+    /// The new callback takes over the attach-time contract: it fires on
+    /// mpv's render thread — and **once synchronously on the calling
+    /// thread, from inside this very call** (registration raises an
+    /// update immediately). Do no work and call no engine methods
+    /// inside — signal your main loop and render/pump from there. That
+    /// rule is load-bearing here in a way it isn't at attach: the
+    /// synchronous fire happens while the engine's internal render lock
+    /// is held, so an engine render call from inside the callback
+    /// deadlocks rather than no-ops. (rsmpv imposes the same no-reentry
+    /// rule on the raw seam.)
+    ///
+    /// The replaced closure is released once its last in-flight
+    /// invocation finishes. The registration is tied to the attached
+    /// context: [`detach_render`](Self::detach_render) drops it, and the
+    /// next attach starts from that attach's own `on_update`.
+    ///
+    /// Errors with [`Error::NotAttached`] when no render context is
+    /// attached — a callback that could never fire is a wiring bug,
+    /// surfaced loudly rather than silently dropped.
+    pub fn set_render_update_callback(
+        &self,
+        on_update: impl Fn() + Send + Sync + 'static,
+    ) -> Result<()> {
+        match self.render.lock().as_mut() {
+            Some(backend) => {
+                backend.set_update_callback(on_update);
+                Ok(())
+            }
+            None => Err(Error::NotAttached),
+        }
     }
 
     /// Process pending render work after an update callback fired (never

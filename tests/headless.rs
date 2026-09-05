@@ -5,7 +5,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use mpv_engine::{EndReason, Engine, PlaybackEvent, PropertyFormat, PropertyValue};
@@ -571,6 +571,114 @@ fn engine_drops_cleanly_without_render() {
     };
     assert!(!engine.has_render());
     drop(engine);
+}
+
+/// `attached_render` answers "which backend?", not just "any backend?":
+/// `None` before attach, the kind while attached, `None` again after
+/// detach. (Only the software kind is reachable headless; the GL arm of
+/// the mapping is a two-variant match pinned at the type level.)
+#[test]
+fn attached_render_reports_backend_kind() {
+    let Some(engine) = video_engine() else {
+        return;
+    };
+    assert_eq!(engine.attached_render(), None);
+
+    engine.attach_sw_render(|| {}).unwrap();
+    assert_eq!(
+        engine.attached_render(),
+        Some(mpv_engine::RenderKind::Software)
+    );
+    assert!(engine.has_render(), "kind and has_render must agree");
+
+    engine.detach_render();
+    assert_eq!(engine.attached_render(), None);
+}
+
+/// Registering a render-update callback with no context attached is a
+/// wiring bug (it could never fire) and must error loudly, not drop the
+/// closure silently — before the first attach and after detach alike.
+#[test]
+fn render_update_callback_requires_attach() {
+    let Some(engine) = video_engine() else {
+        return;
+    };
+    assert!(matches!(
+        engine.set_render_update_callback(|| {}),
+        Err(mpv_engine::Error::NotAttached)
+    ));
+
+    engine.attach_sw_render(|| {}).unwrap();
+    engine.set_render_update_callback(|| {}).unwrap();
+
+    engine.detach_render();
+    assert!(matches!(
+        engine.set_render_update_callback(|| {}),
+        Err(mpv_engine::Error::NotAttached)
+    ));
+}
+
+/// `set_render_update_callback` hands mpv's update signal to the new
+/// closure: the replacement is raised at registration, frame updates
+/// land on it once video flows, and the attach-time closure never fires
+/// again — the construct-share-register flow shells need when their
+/// real callback can only capture state built after the engine.
+#[test]
+fn render_update_callback_replaces_attach_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("test.nut");
+    if generate_video(&source).is_none() {
+        return;
+    }
+    let Some(engine) = video_engine() else {
+        return;
+    };
+
+    let attach_fires = Arc::new(AtomicU32::new(0));
+    let attach_counter = attach_fires.clone();
+    engine
+        .attach_sw_render(move || {
+            attach_counter.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+    assert!(
+        attach_fires.load(Ordering::SeqCst) >= 1,
+        "attach must raise its on_update synchronously"
+    );
+
+    let replacement_fires = Arc::new(AtomicU32::new(0));
+    let replacement_counter = replacement_fires.clone();
+    engine
+        .set_render_update_callback(move || {
+            replacement_counter.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+    let raised = (0..100).any(|_| {
+        std::thread::sleep(Duration::from_millis(10));
+        replacement_fires.load(Ordering::SeqCst) >= 1
+    });
+    assert!(raised, "registration must raise the replacement callback");
+
+    // Any in-flight invocation of the attach-time closure finishes well
+    // within this settle window; from here on its count must not move.
+    std::thread::sleep(Duration::from_millis(50));
+    let attach_count_after_swap = attach_fires.load(Ordering::SeqCst);
+
+    engine.load(source.to_str().unwrap()).unwrap();
+    let before_frames = replacement_fires.load(Ordering::SeqCst);
+    let frames_signaled = (0..100).any(|_| {
+        std::thread::sleep(Duration::from_millis(50));
+        replacement_fires.load(Ordering::SeqCst) > before_frames
+    });
+    assert!(
+        frames_signaled,
+        "frame updates must land on the replacement callback"
+    );
+    assert_eq!(
+        attach_fires.load(Ordering::SeqCst),
+        attach_count_after_swap,
+        "the replaced attach-time callback must not fire after the swap"
+    );
 }
 
 /// A `quit` through the command escape hatch must surface as a
