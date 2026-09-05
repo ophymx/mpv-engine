@@ -174,6 +174,14 @@ WindowServer, no readable `/dev/dri/renderD*`) skips them the same way.
 device (Metal / Vulkan with `VULKAN_EXTERNAL_MEMORY_DMA_BUF`), skipping
 when no capable adapter exists.
 
+There's also a runnable end-to-end demo of the exported-frame → wgpu
+path — a minimal winit player with no GL and no shaders in the app
+(one `copy_texture_to_texture` is the whole compositor):
+
+```sh
+cargo run --features wgpu --example winit_player -- path/to/video.mkv
+```
+
 ## Invariants for contributors
 
 Things a change must not weaken (each is a lesson paid for in one of the

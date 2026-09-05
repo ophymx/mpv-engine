@@ -80,3 +80,10 @@ objc2-io-surface = { version = "0.3.2", optional = true, features = [
 [dev-dependencies]
 tempfile = "3"
 pollster = "0.4"
+# Example-only (winit_player); dev-deps never reach consumers, so the
+# no-toolkit-deps policy above is untouched.
+winit = "0.30"
+
+[[example]]
+name = "winit_player"
+required-features = ["wgpu"]
