@@ -93,6 +93,22 @@ impl GlRenderOptions {
     }
 }
 
+/// Which render backend is attached — what
+/// [`Engine::attached_render`](crate::Engine::attached_render) reports.
+///
+/// Non-exhaustive: a future backend (e.g. Vulkan, if mpv ever exposes it
+/// through the render API) is an additive variant, not a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RenderKind {
+    /// The OpenGL backend
+    /// ([`Engine::attach_gl_render`](crate::Engine::attach_gl_render)).
+    OpenGl,
+    /// The software backend
+    /// ([`Engine::attach_sw_render`](crate::Engine::attach_sw_render)).
+    Software,
+}
+
 /// The one attached render backend. Backends share the engine's single
 /// slot so `AlreadyAttached` and `detach_render` behave uniformly —
 /// mpv allows one render context per handle regardless of type.
@@ -108,6 +124,13 @@ impl RenderBackend {
         match self {
             RenderBackend::Gl(r) => r.ctx.update(),
             RenderBackend::Sw(r) => r.0.update(),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> RenderKind {
+        match self {
+            RenderBackend::Gl(_) => RenderKind::OpenGl,
+            RenderBackend::Sw(_) => RenderKind::Software,
         }
     }
 }

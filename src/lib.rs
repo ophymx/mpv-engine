@@ -12,7 +12,9 @@
 //! adapter crate. See README for the seam map and roadmap.
 //!
 //! The playback surface covers what a player UI consumes: transport
-//! (load/pause/seek/stop), the mixer set (volume/mute/speed), typed
+//! (load — immediate, paused, or deferred until a render context
+//! attaches ([`Engine::load_when_ready`]) — pause/seek/stop), the mixer
+//! set (volume/mute/speed), typed
 //! lifecycle events ([`PlaybackEvent`] — including seek-completion for
 //! scrubber snap and end reasons for playlist logic), and push-based
 //! property observation ([`Engine::observe`]) for state that polling
@@ -25,7 +27,12 @@
 //! Two render backends share one attach slot: OpenGL
 //! ([`Engine::attach_gl_render`] / [`Engine::render_gl`]) and software
 //! ([`Engine::attach_sw_render`] / [`Engine::render_sw`], RGBA into a
-//! caller buffer, no GL anywhere). GL attach takes [`GlRenderOptions`]
+//! caller buffer, no GL anywhere). [`Engine::attached_render`] reports
+//! which one is live ([`RenderKind`]), and the render-update callback
+//! fixed at attach can be replaced afterwards
+//! ([`Engine::set_render_update_callback`]) for shells whose real
+//! closure only exists once the engine is shared. GL attach takes
+//! [`GlRenderOptions`]
 //! to fix the shell's render-loop discipline: whether `render_gl` blocks
 //! until the frame's target time (right for a toolkit paint handler,
 //! wrong on a compositor thread), and mpv's advanced control (which
@@ -67,4 +74,4 @@ pub use engine::{
     PropertyValue,
 };
 pub use error::{Error, Result};
-pub use render::{GlRenderOptions, ProcAddressFn};
+pub use render::{GlRenderOptions, ProcAddressFn, RenderKind};

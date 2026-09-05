@@ -46,15 +46,32 @@ Owned here today:
 - The update callback's threading contract: fires on mpv's render thread
   (`Send` required), **plus once synchronously at registration**; the
   crate has no main-loop opinion — bridging to GTK's `spawn_local` or
-  iced's subscriptions is the shell's job.
+  iced's subscriptions is the shell's job. The callback fixed at attach
+  can be replaced afterwards (`set_render_update_callback`, mirroring
+  the wakeup seam's replaceability) — for shells whose real closure can
+  only capture state built *after* the engine is shared: attach with a
+  placeholder, wrap the engine, then register the weak-capturing
+  closure. The replacement's synchronous registration fire runs outside
+  every engine lock — the same contract as the attach-time fire.
 - `load_paused()` — pause set *before* `loadfile`, so demuxing doesn't
   start before the shell's window is mapped (the init-time variant of the
   same idea tends to hang).
+- `load_when_ready()` — the full deferred-load policy on top of that:
+  on a render-API engine with no context attached, the `loadfile`
+  itself waits and the attach call issues it (an eager pre-attach load
+  fails VO init and drops the video track); where no attach is coming,
+  it degrades to a plain `load`. The full contract — supersede rules,
+  pause interaction, failure surfacing — lives in the rustdoc, its one
+  home. Every shell otherwise reimplements this queue — or worse, ships
+  the eager-load race.
 - A software render backend (`attach_sw_render`/`render_sw`, RGBA into a
   caller buffer, no GL) sharing the one attach slot with the GL backend —
   including the fix for mpv's `"rgb0"` output leaving the fourth byte
   undefined, which consumers treating the buffer as RGBA read as garbage
-  alpha.
+  alpha. `attached_render()` reports which backend is live
+  (`RenderKind`), so shells routing between per-backend paths (GPU
+  texture sampling vs. RGBA upload) don't track the attach outcome in
+  state of their own.
 - An event wakeup seam (`set_wakeup_callback`) so shells get a push
   signal when events queue instead of polling `pump_events` on a timer —
   the only timely path for audio-only use or failures while paused.

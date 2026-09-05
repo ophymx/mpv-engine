@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "mpv-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "parking_lot",
