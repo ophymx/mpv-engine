@@ -107,6 +107,18 @@ fn pump_until(engine: &Engine, mut stop: impl FnMut(&PlaybackEvent) -> bool) -> 
     false
 }
 
+/// [`pump_until`]'s negative-check twin: drain events for roughly `dur`
+/// at the same cadence and return everything seen — for asserting what
+/// must NOT arrive inside a window.
+fn pump_for(engine: &Engine, dur: Duration) -> Vec<PlaybackEvent> {
+    let mut out = Vec::new();
+    for _ in 0..dur.as_millis().div_ceil(50) {
+        std::thread::sleep(Duration::from_millis(50));
+        out.extend(engine.pump_events());
+    }
+    out
+}
+
 /// The spaced-path regression that motivated the array-args command layer:
 /// a file whose name carries spaces, quotes, and parens must reach
 /// `Loaded`. (Under a string-joined command layer this failed with
@@ -240,28 +252,21 @@ fn load_when_ready_loads_on_attach() {
     if generate_video(&source).is_none() {
         return;
     }
-    let engine = match Engine::video().build() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("skipping: mpv engine unavailable: {e}");
-            return;
-        }
+    let Some(engine) = video_engine() else {
+        return;
     };
     engine.load_when_ready(source.to_str().unwrap()).unwrap();
 
     // The failure this API exists to prevent lands within ~100ms of an
-    // eager load; give it 500ms to prove nothing was loaded eagerly.
-    for _ in 0..10 {
-        for ev in engine.pump_events() {
-            match ev {
-                PlaybackEvent::Failed { message, .. } => {
-                    panic!("deferred load must not fail pre-attach: {message}")
-                }
-                PlaybackEvent::Loaded => panic!("load must wait for the attach"),
-                _ => {}
+    // eager load; 200ms of silence proves nothing was loaded eagerly.
+    for ev in pump_for(&engine, Duration::from_millis(200)) {
+        match ev {
+            PlaybackEvent::Failed { message, .. } => {
+                panic!("deferred load must not fail pre-attach: {message}")
             }
+            PlaybackEvent::Loaded => panic!("load must wait for the attach"),
+            _ => {}
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
 
     engine.attach_sw_render(|| {}).unwrap();
@@ -287,12 +292,8 @@ fn pause_before_attach_loads_deferred_file_paused() {
     if generate_video(&source).is_none() {
         return;
     }
-    let engine = match Engine::video().build() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("skipping: mpv engine unavailable: {e}");
-            return;
-        }
+    let Some(engine) = video_engine() else {
+        return;
     };
     engine.load_when_ready(source.to_str().unwrap()).unwrap();
     engine.set_paused(true).unwrap();
@@ -348,16 +349,13 @@ fn command_stop_discards_deferred_load() {
     engine.load_when_ready(source.to_str().unwrap()).unwrap();
     engine.command("stop", &[]).unwrap();
     engine.attach_sw_render(|| {}).unwrap();
-    // Enough pumping to catch a wrongly issued load (Loaded lands well
-    // within this window in the tests above).
-    for _ in 0..10 {
-        for ev in engine.pump_events() {
-            assert!(
-                !matches!(ev, PlaybackEvent::Loaded),
-                "stop before attach must discard the deferred load"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    // A wrongly issued load surfaces well within this window (see the
+    // pre-attach check in load_when_ready_loads_on_attach).
+    for ev in pump_for(&engine, Duration::from_millis(200)) {
+        assert!(
+            !matches!(ev, PlaybackEvent::Loaded),
+            "stop before attach must discard the deferred load"
+        );
     }
     assert!(engine.is_idle(), "nothing may be loaded after the stop");
 }
@@ -452,12 +450,8 @@ fn sw_render_produces_opaque_rgba_frames() {
     if generate_video(&source).is_none() {
         return;
     }
-    let engine = match Engine::video().build() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("skipping: mpv engine unavailable: {e}");
-            return;
-        }
+    let Some(engine) = video_engine() else {
+        return;
     };
 
     // With no backend attached, update processing is a `false` no-op.

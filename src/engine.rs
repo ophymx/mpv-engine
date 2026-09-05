@@ -341,10 +341,12 @@ impl Engine {
     /// Load a file path or URL and start playback.
     ///
     /// For video engines, prefer [`load_when_ready`](Self::load_when_ready)
-    /// (or [`load_paused`](Self::load_paused) with your own start signal)
     /// until the shell's surface is mapped: `loadfile` before a render
-    /// context exists leaves mpv with nowhere to send frames (audio plays,
-    /// video stays black), and demuxing before the window shows wastes work.
+    /// context exists fails VO init and **drops the video track** (see
+    /// `load_when_ready`'s docs for the full failure). Loading paused
+    /// doesn't dodge it — the load itself is what fails — which is why
+    /// the deferred variant exists and why
+    /// [`load_paused`](Self::load_paused) is no pre-attach alternative.
     pub fn load(&self, source: &str) -> Result<()> {
         // A plain load supersedes any pending deferred load; the guard is
         // held across the command so the two are one transport step.
@@ -408,7 +410,11 @@ impl Engine {
     /// The defer-or-load decision reads the **current** `vo` property,
     /// so it tracks runtime `vo` changes (via
     /// [`set_property`](Self::set_property)) and values picked up from a
-    /// config file — not just what the builder set. A deferred `loadfile`
+    /// config file — not just what the builder set. The same rule covers
+    /// the window after a [`detach_render`](Self::detach_render): with
+    /// `vo` still on the render API, sources queue again awaiting a
+    /// re-attach — a shell going render-less for good should switch `vo`
+    /// (e.g. to `null`) so loads run immediately. A deferred `loadfile`
     /// that fails at attach time surfaces as
     /// [`PlaybackEvent::Failed`] on the next
     /// [`pump_events`](Self::pump_events), never as an `Err` from the
@@ -826,6 +832,14 @@ impl Engine {
     /// into whatever context is current — in GTK that painted artifacts
     /// over the whole window. The software backend has no such
     /// requirement; detach from any thread.
+    ///
+    /// After a detach, [`load_when_ready`](Self::load_when_ready) defers
+    /// again — `vo` still names the render API, so sources queue awaiting
+    /// a re-attach. A shell detaching *for good* (say, dropping to
+    /// audio-only) should also switch `vo` (e.g.
+    /// [`set_property`](Self::set_property)`("vo", "null")`); the
+    /// defer-or-load decision reads the live `vo`, so loads then run
+    /// immediately instead of parking.
     pub fn detach_render(&self) {
         if self.render.lock().take().is_some() {
             tracing::debug!("mpv render context detached");

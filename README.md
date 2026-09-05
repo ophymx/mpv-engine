@@ -55,19 +55,14 @@ Owned here today:
 - `load_paused()` — pause set *before* `loadfile`, so demuxing doesn't
   start before the shell's window is mapped (the init-time variant of the
   same idea tends to hang).
-- `load_when_ready()` — the full deferred-load policy on top of that: on
-  a render-API engine with no context attached, the *source is queued*
-  and the attach call issues the `loadfile`; on engines that never
-  attach (`vo=null`, a windowed vo) it degrades to a plain `load`. The
-  whole load is deferred because an eager `loadfile` before the context
-  exists doesn't survive: mpv fails VO init and drops the video track —
-  a video-only file dies with `MPV_ERROR_NOTHING_TO_PLAY`, a file with
-  audio plays sound over a permanently black surface. `load` /
-  `load_paused` / `stop` before the attach supersede the queued source,
-  and pause intent needs no special casing (the `pause` property
-  persists across `loadfile`, so a pre-attach pause loads the deferred
-  file paused). Every shell otherwise reimplements this queue — or
-  worse, ships the eager-load race.
+- `load_when_ready()` — the full deferred-load policy on top of that:
+  on a render-API engine with no context attached, the `loadfile`
+  itself waits and the attach call issues it (an eager pre-attach load
+  fails VO init and drops the video track); where no attach is coming,
+  it degrades to a plain `load`. The full contract — supersede rules,
+  pause interaction, failure surfacing — lives in the rustdoc, its one
+  home. Every shell otherwise reimplements this queue — or worse, ships
+  the eager-load race.
 - A software render backend (`attach_sw_render`/`render_sw`, RGBA into a
   caller buffer, no GL) sharing the one attach slot with the GL backend —
   including the fix for mpv's `"rgb0"` output leaving the fourth byte
