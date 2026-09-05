@@ -1,13 +1,11 @@
-use std::ffi::{CStr, c_char, c_int};
-use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Once};
 
 use parking_lot::Mutex;
-use rsmpv::sys;
-use rsmpv::{Format, Mpv};
+use rsmpv::{EndFileReason, Event, Format, Mpv, PropertyData, sys};
 
 use crate::error::{Error, Result, describe_code};
-use crate::render::{GlRender, ProcAddressFn, RenderBackend, SwRender};
+use crate::render::{GlRender, GlRenderOptions, ProcAddressFn, RenderBackend, SwRender};
 
 /// Force `LC_NUMERIC=C` exactly once before the first `mpv_create`. mpv
 /// refuses to work under a comma-decimal locale (its option/number parsing
@@ -56,6 +54,12 @@ pub enum PlaybackEvent {
         name: String,
         value: PropertyValue,
     },
+    /// The mpv core is shutting down — e.g. a `quit` issued through
+    /// [`Engine::command`], or an input binding if input was enabled.
+    /// No further events follow; drop the [`Engine`] soon. (A file that
+    /// was playing also gets an [`Ended`](Self::Ended) with
+    /// [`EndReason::Quit`] first.)
+    Shutdown,
     /// mpv aborted playback — unreadable, corrupt, empty, or an
     /// unrecognized/unsupported format.
     Failed {
@@ -83,13 +87,18 @@ pub enum EndReason {
     Other(i32),
 }
 
-fn end_reason(reason: sys::mpv_end_file_reason) -> EndReason {
+fn end_reason(reason: EndFileReason) -> EndReason {
     match reason {
-        sys::MPV_END_FILE_REASON_EOF => EndReason::Eof,
-        sys::MPV_END_FILE_REASON_STOP => EndReason::Stop,
-        sys::MPV_END_FILE_REASON_QUIT => EndReason::Quit,
-        sys::MPV_END_FILE_REASON_REDIRECT => EndReason::Redirect,
-        other => EndReason::Other(other),
+        EndFileReason::Eof => EndReason::Eof,
+        EndFileReason::Stop => EndReason::Stop,
+        EndFileReason::Quit => EndReason::Quit,
+        EndFileReason::Redirect => EndReason::Redirect,
+        EndFileReason::Unknown(code) => EndReason::Other(code),
+        // `Error` is routed to `Failed` before this runs, and a future
+        // named reason (the enum is non_exhaustive) carries no raw code
+        // to forward — mpv's reason codes are non-negative, so -1 is
+        // recognizably out-of-band until this crate names the variant.
+        _ => EndReason::Other(-1),
     }
 }
 
@@ -104,34 +113,17 @@ pub enum PropertyValue {
     Str(String),
 }
 
-/// Decode a `mpv_event_property`'s payload into an owned value. `None`
-/// when the property is unavailable (`MPV_FORMAT_NONE`) or the format is
-/// one this crate doesn't deliver — those notifications are skipped, not
+/// Map an event's decoded property payload onto this crate's owned value.
+/// `None` when the property is unavailable or the format is one this crate
+/// doesn't deliver (e.g. `Node`) — those notifications are skipped, not
 /// surfaced as bogus values.
-///
-/// # Safety
-/// `prop` must be a valid property event payload from `mpv_wait_event`,
-/// with `data` matching `format` per client.h.
-unsafe fn property_value(prop: &sys::mpv_event_property) -> Option<PropertyValue> {
-    if prop.data.is_null() {
-        return None;
-    }
-    // SAFETY: caller contract — `data` points to the format's C type.
-    unsafe {
-        match prop.format {
-            sys::MPV_FORMAT_FLAG => {
-                Some(PropertyValue::Flag(*(prop.data as *const c_int) != 0))
-            }
-            sys::MPV_FORMAT_INT64 => Some(PropertyValue::Int(*(prop.data as *const i64))),
-            sys::MPV_FORMAT_DOUBLE => Some(PropertyValue::Double(*(prop.data as *const f64))),
-            sys::MPV_FORMAT_STRING | sys::MPV_FORMAT_OSD_STRING => {
-                let ptr = *(prop.data as *const *const c_char);
-                (!ptr.is_null()).then(|| {
-                    PropertyValue::Str(CStr::from_ptr(ptr).to_string_lossy().into_owned())
-                })
-            }
-            _ => None,
-        }
+fn property_value(data: PropertyData) -> Option<PropertyValue> {
+    match data {
+        PropertyData::Flag(v) => Some(PropertyValue::Flag(v)),
+        PropertyData::Int64(v) => Some(PropertyValue::Int(v)),
+        PropertyData::Double(v) => Some(PropertyValue::Double(v)),
+        PropertyData::String(s) | PropertyData::OsdString(s) => Some(PropertyValue::Str(s)),
+        _ => None,
     }
 }
 
@@ -235,7 +227,7 @@ impl EngineBuilder {
         for (name, value) in &self.props {
             builder = builder.set_property(name, value.as_str())?;
         }
-        let mpv = builder.build()?;
+        let mpv = Arc::new(builder.build()?);
         Ok(Engine {
             render: Mutex::new(None),
             attach: Mutex::new(()),
@@ -254,10 +246,10 @@ impl EngineBuilder {
 /// callback to its own main loop, and drains
 /// [`pump_events`](Engine::pump_events) on whatever cadence suits it.
 pub struct Engine {
-    /// Live render context (either backend), if any. Must be dropped
-    /// before `mpv` — the C-side context references the handle. `Drop`
-    /// below enforces the order explicitly so field reordering can't
-    /// silently break it.
+    /// Live render context (either backend), if any. Freed-before-
+    /// terminate ordering is structural: the context co-owns the core
+    /// through its own `Arc<Mpv>`, so the core cannot terminate under a
+    /// live context regardless of field order.
     render: Mutex<Option<RenderBackend>>,
     /// Serializes attach calls: concurrent `mpv_render_context_create`
     /// on one handle violates render.h's threading rules, and slot
@@ -265,23 +257,25 @@ pub struct Engine {
     /// the `render` lock — the synchronous `on_update` during create
     /// must stay free to touch render methods.
     attach: Mutex<()>,
-    /// Serializes `mpv_wait_event`: every other libmpv entry point is
-    /// internally synchronized, but the event loop must not be pumped from
-    /// two threads at once. (rsmpv encodes that rule as `wait_event`
-    /// taking `&mut self`, which a shared `Engine` can't provide — so the
-    /// pump goes through `rsmpv::sys` under this lock instead.)
+    /// Keeps each [`pump_events`](Engine::pump_events) drain atomic.
+    /// rsmpv's `poll_event` is safe to call concurrently, but concurrent
+    /// pollers *split* the stream (each event goes to exactly one
+    /// caller) — two racing pumps would tear ordered sequences like
+    /// `Loaded` → `Ended` across their result batches.
     pump: Mutex<()>,
     /// Userdata ids handed to `mpv_observe_property`; each observation
     /// gets a fresh one so [`unobserve`](Engine::unobserve) is precise.
     next_observe_id: AtomicU64,
-    mpv: Mpv,
+    /// Shared with any live render context, which holds its own clone.
+    mpv: Arc<Mpv>,
 }
 
 // `Engine: Send + Sync` is auto-derived: rsmpv marks `Mpv` Send + Sync
-// (libmpv is thread-safe per client.h; the one exception, single-caller
-// `mpv_wait_event`, is covered by the `pump` mutex here), and the
-// remaining fields are sync primitives. Do not add manual `unsafe impl`s
-// — they'd silence the compiler if a future field is genuinely `!Send`.
+// (libmpv is thread-safe per client.h; the one caveat, single-waiter
+// `mpv_wait_event`, is upheld inside rsmpv's `poll_event`), the render
+// contexts are `Send` behind a `Sync` mutex, and the remaining fields
+// are sync primitives. Do not add manual `unsafe impl`s — they'd
+// silence the compiler if a future field is genuinely `!Send`.
 
 impl Engine {
     /// Neutral builder with no properties preset — for consumers whose
@@ -474,74 +468,74 @@ impl Engine {
     /// it spuriously. Treat a wakeup as "check the queue", never "an
     /// event arrived".
     ///
-    /// Fires on arbitrary mpv-internal threads, possibly re-entrantly
-    /// with other engine calls: do no work and call no engine methods
-    /// inside — signal your main loop and pump from there (the same
-    /// bridging pattern as the render-update callback). Replaces any
-    /// previously registered wakeup callback.
-    pub fn set_wakeup_callback(&self, on_wakeup: impl Fn() + Send + 'static) {
-        // rsmpv owns the closure lifecycle: replaced callbacks are kept
-        // alive until the handle drops (libmpv offers no way to
-        // synchronize with an in-flight callback), and everything is
-        // unhooked safely during handle teardown. mpv still only invokes
-        // the latest registration.
+    /// Fires on arbitrary mpv-internal threads — possibly several at
+    /// once (hence `Sync`), possibly re-entrantly with other engine
+    /// calls: do no work and call no engine methods inside — signal your
+    /// main loop and pump from there (the same bridging pattern as the
+    /// render-update callback). Replaces any previously registered
+    /// wakeup callback.
+    pub fn set_wakeup_callback(&self, on_wakeup: impl Fn() + Send + Sync + 'static) {
+        // rsmpv owns the closure lifecycle: a replaced callback is freed
+        // once its last in-flight invocation finishes (possibly on an
+        // mpv-internal thread), and everything is unhooked safely during
+        // handle teardown. mpv only invokes the latest registration.
         self.mpv.set_wakeup_callback(on_wakeup);
     }
 
     /// Drain pending mpv events into typed [`PlaybackEvent`]s. Call on a
     /// timer or after the update callback; never blocks.
     ///
-    /// This pumps through `rsmpv::sys` rather than `rsmpv`'s safe
-    /// `wait_event`: the safe method takes `&mut self` (libmpv allows one
-    /// concurrent waiter per handle), which a shared engine can't
-    /// provide — the `pump` mutex enforces the same exclusivity here.
+    /// Built on rsmpv's non-blocking `poll_event` (`&self`; internally
+    /// serialized against libmpv's one-waiter-per-handle rule). The
+    /// engine adds the `pump` lock on top so each drain is atomic —
+    /// concurrent pollers would otherwise split the stream, tearing
+    /// ordered sequences across callers' batches.
     pub fn pump_events(&self) -> Vec<PlaybackEvent> {
         let _guard = self.pump.lock();
         let mut out = Vec::new();
-        loop {
-            // SAFETY: the pump lock makes this the only `mpv_wait_event`
-            // caller on the handle; the returned event (and everything it
-            // points to) is valid until the next call on this handle,
-            // which can't happen while the lock is held. Timeout 0 never
-            // blocks.
-            let ev = unsafe { &*sys::mpv_wait_event(self.mpv.as_raw(), 0.0) };
-            match ev.event_id {
-                sys::MPV_EVENT_NONE => break,
-                sys::MPV_EVENT_FILE_LOADED => out.push(PlaybackEvent::Loaded),
-                sys::MPV_EVENT_END_FILE => {
-                    // SAFETY: END_FILE's data is `mpv_event_end_file`.
-                    let ef = unsafe { &*(ev.data as *const sys::mpv_event_end_file) };
-                    // An errored end-of-file (bad format, load failure,
-                    // missing/corrupt/empty data) surfaces as a typed
-                    // `Failed` carrying mpv's error code — never as a
-                    // quiet `Ended`.
-                    if ef.reason == sys::MPV_END_FILE_REASON_ERROR {
-                        out.push(PlaybackEvent::Failed {
-                            code: ef.error,
-                            message: describe_code(ef.error),
-                        });
-                    } else {
-                        out.push(PlaybackEvent::Ended {
-                            reason: end_reason(ef.reason),
-                        });
-                    }
+        while let Some(ev) = self.mpv.poll_event() {
+            match ev {
+                Event::Shutdown => out.push(PlaybackEvent::Shutdown),
+                Event::FileLoaded => out.push(PlaybackEvent::Loaded),
+                // An errored end-of-file (bad format, load failure,
+                // missing/corrupt/empty data) surfaces as a typed
+                // `Failed` carrying mpv's error code — never as a quiet
+                // `Ended`.
+                Event::EndFile {
+                    reason: EndFileReason::Error,
+                    error,
+                    ..
+                } => {
+                    // Event errors always map onto a raw libmpv code
+                    // (rsmpv decodes them from one); `error` itself is
+                    // only absent if mpv violates its own contract of
+                    // setting a code on errored ends. Generic backstops
+                    // both impossibilities.
+                    let code = error
+                        .and_then(|e| e.raw_code())
+                        .unwrap_or(sys::MPV_ERROR_GENERIC);
+                    out.push(PlaybackEvent::Failed {
+                        code,
+                        message: describe_code(code),
+                    });
                 }
-                sys::MPV_EVENT_PLAYBACK_RESTART => out.push(PlaybackEvent::PlaybackRestart),
-                sys::MPV_EVENT_PROPERTY_CHANGE => {
-                    // SAFETY: PROPERTY_CHANGE's data is
-                    // `mpv_event_property`.
-                    let prop = unsafe { &*(ev.data as *const sys::mpv_event_property) };
+                Event::EndFile { reason, .. } => out.push(PlaybackEvent::Ended {
+                    reason: end_reason(reason),
+                }),
+                Event::PlaybackRestart => out.push(PlaybackEvent::PlaybackRestart),
+                Event::PropertyChange {
+                    userdata,
+                    name,
+                    data,
+                } => {
                     // A `None` here means the property became unavailable
-                    // (format NONE) — skipped rather than delivered as a
-                    // bogus value, and the drain keeps going.
-                    if let Some(value) = unsafe { property_value(prop) } {
+                    // (or arrived in a format this crate doesn't deliver)
+                    // — skipped rather than delivered as a bogus value,
+                    // and the drain keeps going.
+                    if let Some(value) = property_value(data) {
                         out.push(PlaybackEvent::PropertyChanged {
-                            id: ObserveId(ev.reply_userdata),
-                            // SAFETY: `name` is a valid C string for the
-                            // event's lifetime.
-                            name: unsafe { CStr::from_ptr(prop.name) }
-                                .to_string_lossy()
-                                .into_owned(),
+                            id: ObserveId(userdata),
+                            name,
                             value,
                         });
                     }
@@ -574,10 +568,28 @@ impl Engine {
     /// state — construct the `Engine`, wrap it in your `Arc`/shared
     /// structure, *then* attach with the weak-capturing closure, then
     /// load.
-    pub fn attach_gl_render(
+    ///
+    /// `options` fixes the shell's render-loop discipline at attach:
+    /// frame pacing ([`GlRenderOptions::block_for_target_time`]) and
+    /// mpv's advanced control ([`GlRenderOptions::advanced_control`],
+    /// which obligates [`render_update`](Self::render_update) after every
+    /// update callback). [`GlRenderOptions::default`] is mpv's stock
+    /// behavior.
+    ///
+    /// # Safety
+    /// GL-context currency is a dynamic, per-call rule the type system
+    /// cannot capture (rsmpv's OpenGL constructor is `unsafe` for the
+    /// same reason, and this crate forwards the obligation rather than
+    /// hiding it): the target GL context must be current on the calling
+    /// thread now, on every later [`render_gl`](Self::render_gl) or
+    /// [`render_update`](Self::render_update), and when the context is
+    /// freed — [`detach_render`](Self::detach_render) or the engine's
+    /// drop. Violating the rule is undefined behavior.
+    pub unsafe fn attach_gl_render(
         &self,
         get_proc_address: ProcAddressFn,
-        on_update: impl Fn() + Send + 'static,
+        options: GlRenderOptions,
+        on_update: impl Fn() + Send + Sync + 'static,
     ) -> Result<()> {
         let _attaching = self.attach.lock();
         if self.render.lock().is_some() {
@@ -587,8 +599,12 @@ impl Engine {
         // `on_update` synchronously, and holding the render lock across
         // that call would deadlock an `on_update` that touches render
         // methods. The attach lock keeps a second attacher out, so the
-        // slot check above stays authoritative.
-        let render = GlRender::create(self.mpv.as_raw(), get_proc_address, on_update)?;
+        // slot check above stays authoritative. (An Arc clone goes in —
+        // never the engine's own reference — so a failed create can't
+        // drop the core.)
+        // SAFETY: GL-currency contract forwarded to the caller (above).
+        let render =
+            unsafe { GlRender::create(self.mpv.clone(), get_proc_address, options, on_update)? };
         *self.render.lock() = Some(RenderBackend::Gl(render));
         tracing::debug!("mpv GL render context attached");
         Ok(())
@@ -605,13 +621,13 @@ impl Engine {
     /// render thread plus once synchronously (outside the render lock,
     /// before the context is stored), and typically captures a `Weak`
     /// handle — construct, share, attach, then load.
-    pub fn attach_sw_render(&self, on_update: impl Fn() + Send + 'static) -> Result<()> {
+    pub fn attach_sw_render(&self, on_update: impl Fn() + Send + Sync + 'static) -> Result<()> {
         // Same locking shape as `attach_gl_render`, for the same reasons.
         let _attaching = self.attach.lock();
         if self.render.lock().is_some() {
             return Err(Error::AlreadyAttached);
         }
-        let render = SwRender::create(self.mpv.as_raw(), on_update)?;
+        let render = SwRender::create(self.mpv.clone(), on_update)?;
         *self.render.lock() = Some(RenderBackend::Sw(render));
         tracing::debug!("mpv software render context attached");
         Ok(())
@@ -633,14 +649,28 @@ impl Engine {
         self.render.lock().is_some()
     }
 
+    /// Process pending render work after an update callback fired (never
+    /// call it from inside the callback itself — that's forbidden, like
+    /// any other engine call there). Returns `true` when a new frame
+    /// should be drawn. Optional under default options; **mandatory
+    /// promptly after every update callback** when the GL backend was
+    /// attached with [`GlRenderOptions::advanced_control`]. `false` when
+    /// no backend is attached. For the GL backend, the attach contract's
+    /// GL-currency rule covers this call too.
+    pub fn render_update(&self) -> bool {
+        self.render.lock().as_mut().is_some_and(RenderBackend::update)
+    }
+
     /// Draw the current frame into `fbo` (`0` = default framebuffer) with
     /// the GL context current. No-op before
     /// [`attach_gl_render`](Self::attach_gl_render); errors with
     /// [`Error::RenderBackendMismatch`] if the software backend is
     /// attached instead. `flip_y` flips the output for flipped-origin
-    /// targets (GTK's GLArea wants `true`).
+    /// targets (GTK's GLArea wants `true`). Whether this call blocks
+    /// until the frame's target display time was fixed at attach
+    /// ([`GlRenderOptions::block_for_target_time`]; the default blocks).
     pub fn render_gl(&self, fbo: i32, w: i32, h: i32, flip_y: bool) -> Result<()> {
-        match self.render.lock().as_ref() {
+        match self.render.lock().as_mut() {
             Some(RenderBackend::Gl(r)) => r.render(fbo, w, h, flip_y),
             Some(_) => Err(Error::RenderBackendMismatch),
             None => Ok(()),
@@ -654,7 +684,7 @@ impl Engine {
     /// [`Error::RenderBackendMismatch`] if the OpenGL backend is
     /// attached instead.
     pub fn render_sw(&self, w: i32, h: i32, buf: &mut Vec<u8>) -> Result<()> {
-        match self.render.lock().as_ref() {
+        match self.render.lock().as_mut() {
             Some(RenderBackend::Sw(r)) => r.render(w, h, buf),
             Some(_) => Err(Error::RenderBackendMismatch),
             None => Ok(()),
@@ -662,14 +692,10 @@ impl Engine {
     }
 }
 
-impl Drop for Engine {
-    fn drop(&mut self) {
-        // Render context strictly before the mpv handle. If a GL target
-        // was attached, prefer an explicit `detach_render` with the GL
-        // context current — this fallback can't make that guarantee.
-        // (Wakeup-callback teardown is rsmpv's: closures outlive the
-        // handle's `mpv_terminate_destroy`, so mpv can never fire into
-        // freed memory.)
-        self.render.lock().take();
-    }
-}
+// No manual `Drop`: the render context co-owns the core through its own
+// `Arc<Mpv>`, so it is structurally freed before the core terminates —
+// field order can't break that anymore. If a GL target was attached,
+// prefer an explicit `detach_render` with the GL context current before
+// dropping; the implicit drop can't make that guarantee. (Wakeup- and
+// update-callback teardown is rsmpv's: closures are released safely even
+// against in-flight invocations, so mpv can never fire into freed memory.)

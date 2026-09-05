@@ -150,18 +150,18 @@ dependencies = [
 
 [[package]]
 name = "rsmpv"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "493d5a9b6bc194a061557268332dbc53a6756cb0ebcd98bd4b3225090fa01c25"
+checksum = "ccbd32637324c2e35c00e0e4268f2ba16e0fa337b8e58749787ce1a6daee827d"
 dependencies = [
  "rsmpv-sys",
 ]
 
 [[package]]
 name = "rsmpv-sys"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc8177df23d9a2289359690e431a1f9d4d115df2e22727697d08b651014876e6"
+checksum = "dd7d3d6bf8c3f290a357ef8782b7fd9ce6aa841ceb8a63da239f49e4dc5efc37"
 dependencies = [
  "pkg-config",
 ]

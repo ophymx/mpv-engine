@@ -20,9 +20,9 @@ categories = ["multimedia::video"]
 libc = "0.2"
 # rsmpv/rsmpv-sys are permissively licensed (MIT OR Apache-2.0 / ISC)
 # clean-room bindings; the only copyleft in a consumer's tree is libmpv
-# itself — see LICENSING.md. `render` pulls in the render.h bindings the
-# raw render seam uses.
-rsmpv = { version = "0.1", features = ["render"] }
+# itself — see LICENSING.md. `render` pulls in the safe render.h wrapper
+# the render seam is built on.
+rsmpv = { version = "0.2", features = ["render"] }
 parking_lot = "0.12"
 thiserror = "2"
 tracing = "0.1"

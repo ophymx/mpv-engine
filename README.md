@@ -76,9 +76,18 @@ mpv-engine (core: this crate)
 ```
 
 Shells attach a render target with `attach_gl_render(get_proc_address,
-on_update)` and draw via `render_gl(fbo, w, h, flip_y)` from their paint
-handler — or, GL-free, `attach_sw_render(on_update)` and pull RGBA bytes
-with `render_sw(w, h, &mut buf)`. Events are drained with
+options, on_update)` (an `unsafe` fn — it carries the GL-context-currency
+contract the type system can't express: the target context must be
+current at attach, every `render_gl`/`render_update`, and detach/drop)
+and draw via `render_gl(fbo, w, h, flip_y)` from their paint handler —
+or, GL-free and fully safe, `attach_sw_render(on_update)` and pull RGBA
+bytes with `render_sw(w, h, &mut buf)`. `GlRenderOptions` fixes the
+shell's render-loop discipline at attach: the default blocks `render_gl`
+until the frame's target display time (right for a GTK paint handler),
+while a shell rendering on a compositor thread (iced `prepare`) sets
+`block_for_target_time: false` and paces frames itself (or sets
+`video-timing-offset=0`); `advanced_control` is there too, obligating
+`render_update()` after every update callback. Events are drained with
 `pump_events()` on the shell's own cadence, with `set_wakeup_callback`
 as the push signal for shells that don't poll. Headless/audio
 use (`Engine::headless()`, `vo=null`) needs neither — that's also how the

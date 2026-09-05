@@ -25,7 +25,11 @@
 //! Two render backends share one attach slot: OpenGL
 //! ([`Engine::attach_gl_render`] / [`Engine::render_gl`]) and software
 //! ([`Engine::attach_sw_render`] / [`Engine::render_sw`], RGBA into a
-//! caller buffer, no GL anywhere). Event delivery is pull-based
+//! caller buffer, no GL anywhere). GL attach takes [`GlRenderOptions`]
+//! to fix the shell's render-loop discipline: whether `render_gl` blocks
+//! until the frame's target time (right for a toolkit paint handler,
+//! wrong on a compositor thread), and mpv's advanced control (which
+//! obligates [`Engine::render_update`] after every update callback). Event delivery is pull-based
 //! ([`Engine::pump_events`]) with an optional push signal
 //! ([`Engine::set_wakeup_callback`]) for shells that don't want a
 //! polling timer.
@@ -33,8 +37,11 @@
 //! Quirks this crate owns so consumers don't have to rediscover them:
 //! - `LC_NUMERIC=C` forced before `mpv_create` (toolkits setlocale behind
 //!   your back; mpv's number parsing breaks under comma-decimal locales).
-//! - Render context freed strictly before the mpv handle, and only with
-//!   the GL context current ([`Engine::detach_render`]).
+//! - Render context freed strictly before the mpv handle — structural
+//!   since rsmpv 0.2 (the context co-owns the core) — and, for OpenGL,
+//!   only with the GL context current: an obligation
+//!   [`Engine::attach_gl_render`] carries as its `unsafe` contract (see
+//!   [`Engine::detach_render`]).
 //! - Commands pass pre-tokenized argument arrays (`mpv_command`), so paths
 //!   with spaces/quotes need no escaping — pinned by a regression test.
 //! - Errored end-of-file surfaces as a typed
@@ -45,8 +52,9 @@
 //!   synchronous call at registration) is documented at the seam.
 //!
 //! No toolkit dependencies, no git dependencies, no main-loop opinions:
-//! events are *pumped*, and the update callback is `Send` — bridging to a
-//! main loop is the shell's job, because that part is toolkit-shaped.
+//! events are *pumped*, and the update callback is `Send + Sync` —
+//! bridging to a main loop is the shell's job, because that part is
+//! toolkit-shaped.
 
 mod engine;
 mod error;
@@ -57,4 +65,4 @@ pub use engine::{
     PropertyValue,
 };
 pub use error::{Error, Result};
-pub use render::ProcAddressFn;
+pub use render::{GlRenderOptions, ProcAddressFn};

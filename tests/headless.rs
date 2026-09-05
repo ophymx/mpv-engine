@@ -264,6 +264,9 @@ fn sw_render_produces_opaque_rgba_frames() {
         }
     };
 
+    // With no backend attached, update processing is a `false` no-op.
+    assert!(!engine.render_update());
+
     let frame_ready = Arc::new(AtomicBool::new(false));
     let flag = frame_ready.clone();
     engine
@@ -283,6 +286,17 @@ fn sw_render_produces_opaque_rgba_frames() {
         frame_ready.load(Ordering::SeqCst)
     });
     assert!(ready, "update callback must signal a frame");
+
+    // The signaled frame must also be visible through the pull side of
+    // the seam: `render_update` reports a frame wants drawing.
+    let update_frame = (0..100).any(|_| {
+        if engine.render_update() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        false
+    });
+    assert!(update_frame, "render_update must report the pending frame");
 
     let mut buf = Vec::new();
     engine.render_sw(64, 64, &mut buf).unwrap();
@@ -338,6 +352,20 @@ fn wakeup_callback_fires_on_events() {
     );
 }
 
+/// `GlRenderOptions` must be constructible from outside the crate: it is
+/// `#[non_exhaustive]`, which forbids struct expressions here (E0639 —
+/// functional record update gets no exemption), so the chainable setters
+/// are the consumer path and this file being an external crate makes the
+/// compile itself the probe. Pure construction — no mpv needed.
+#[test]
+fn gl_render_options_build_externally() {
+    let opts = mpv_engine::GlRenderOptions::default()
+        .block_for_target_time(false)
+        .advanced_control(true);
+    assert!(!opts.block_for_target_time);
+    assert!(opts.advanced_control);
+}
+
 /// Engines drop cleanly without a render context ever attached (the
 /// explicit Drop-order path with an empty render slot).
 #[test]
@@ -347,4 +375,20 @@ fn engine_drops_cleanly_without_render() {
     };
     assert!(!engine.has_render());
     drop(engine);
+}
+
+/// A `quit` through the command escape hatch must surface as a
+/// `Shutdown` event — the shell's only direct signal that the core is
+/// gone (an `Ended { reason: Quit }` only accompanies it when a file was
+/// playing).
+#[test]
+fn quit_surfaces_shutdown_event() {
+    let Some(engine) = headless_engine() else {
+        return;
+    };
+    engine.command("quit", &[]).unwrap();
+    assert!(pump_until(&engine, |ev| matches!(
+        ev,
+        PlaybackEvent::Shutdown
+    )));
 }

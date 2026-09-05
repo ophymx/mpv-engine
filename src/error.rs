@@ -5,10 +5,6 @@ use thiserror::Error;
 pub enum Error {
     #[error("mpv: {0}")]
     Mpv(#[from] rsmpv::Error),
-    /// A raw `mpv_render_*` call failed (these go through `rsmpv::sys`
-    /// directly — see `render.rs` for why). Carries the mpv error code.
-    #[error("mpv render: {}", describe_code(*.0))]
-    Render(i32),
     /// An attach called while a render context is already live. mpv
     /// supports exactly one render context per handle, of either backend.
     #[error("a render context is already attached")]
