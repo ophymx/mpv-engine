@@ -107,12 +107,13 @@ pub enum RenderKind {
     /// The software backend
     /// ([`Engine::attach_sw_render`](crate::Engine::attach_sw_render)).
     Software,
-    /// The exported-frame backend (`export` feature, macOS + Linux —
-    /// `Engine::attach_exported_render`): the engine renders on its own
-    /// hidden GL context and hands the shell zero-copy exportable frames
-    /// (IOSurface-backed / DMA-BUF-backed). The variant exists on every
-    /// platform so cross-platform shells can match on it
-    /// unconditionally; only the feature produces it.
+    /// The exported-frame backend (`export` feature, macOS + Linux +
+    /// Windows — `Engine::attach_exported_render`): the engine renders on
+    /// its own hidden GL context and hands the shell zero-copy exportable
+    /// frames (IOSurface-backed / DMA-BUF-backed / shared-D3D11-texture-
+    /// backed). The variant exists on every platform so cross-platform
+    /// shells can match on it unconditionally; only the feature produces
+    /// it.
     Exported,
 }
 
@@ -122,7 +123,10 @@ pub enum RenderKind {
 pub(crate) enum RenderBackend {
     Gl(GlRender),
     Sw(SwRender),
-    #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(
+        feature = "export",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
     Exported(crate::export::ExportedRender),
 }
 
@@ -135,7 +139,10 @@ impl RenderBackend {
         match self {
             RenderBackend::Gl(r) => r.ctx.update(),
             RenderBackend::Sw(r) => r.0.update(),
-            #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+            #[cfg(all(
+                feature = "export",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
             RenderBackend::Exported(_) => false,
         }
     }
@@ -144,7 +151,10 @@ impl RenderBackend {
         match self {
             RenderBackend::Gl(_) => RenderKind::OpenGl,
             RenderBackend::Sw(_) => RenderKind::Software,
-            #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+            #[cfg(all(
+                feature = "export",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
             RenderBackend::Exported(_) => RenderKind::Exported,
         }
     }
@@ -156,7 +166,10 @@ impl RenderBackend {
     /// detach may hold while joining this very thread.
     pub(crate) fn on_own_render_thread(&self) -> bool {
         match self {
-            #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+            #[cfg(all(
+                feature = "export",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
             RenderBackend::Exported(r) => r.is_render_thread(),
             _ => false,
         }

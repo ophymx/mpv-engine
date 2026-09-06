@@ -1,7 +1,8 @@
 //! Shared helpers for the exported-backend test binaries
-//! (`export`/`wgpu` features, macOS + Linux). Every helper degrades to
-//! a skip (`None`) when tooling is missing — no ffmpeg, no libmpv, or
-//! no GPU access (WindowServer on macOS, DRM render node on Linux).
+//! (`export`/`wgpu` features, macOS + Linux + Windows). Every helper
+//! degrades to a skip (`None`) when tooling is missing — no ffmpeg, no
+//! libmpv, or no GPU access (WindowServer on macOS, a DRM render node on
+//! Linux, an OpenGL ICD with `WGL_NV_DX_interop2` on Windows).
 #![allow(dead_code)]
 
 use std::path::Path;

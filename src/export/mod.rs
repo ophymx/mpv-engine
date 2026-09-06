@@ -1,26 +1,29 @@
-//! Exported-frame render backend (`export` feature, macOS + Linux): the
-//! engine owns a hidden GL context on a dedicated render thread — CGL
-//! on macOS, surfaceless EGL over a DRM render node on Linux — mpv
-//! renders into exportable framebuffers there (IOSurface-backed /
-//! DMA-BUF-backed), and the shell receives zero-copy [`ExportedFrame`]
-//! handles it imports into Metal / Vulkan (or wgpu) directly — no pixel
-//! ever crosses the CPU, and no GL leaks into the shell.
+//! Exported-frame render backend (`export` feature, macOS + Linux +
+//! Windows): the engine owns a hidden GL context on a dedicated render
+//! thread — CGL on macOS, surfaceless EGL over a DRM render node on
+//! Linux, WGL on an invisible window on Windows — mpv renders into
+//! exportable framebuffers there (IOSurface-backed / DMA-BUF-backed /
+//! shared-D3D11-texture-backed), and the shell receives zero-copy
+//! [`ExportedFrame`] handles it imports into Metal / Vulkan / D3D (or
+//! wgpu) directly — no pixel ever crosses the CPU, and no GL leaks into
+//! the shell.
 //!
 //! Why this shape: libmpv's render API speaks only OpenGL and software,
 //! and mpv never inspects what memory backs the FBO it is handed — so
-//! the consumer-side fix for "no Metal/Vulkan render API" is to make the
-//! FBO's color attachment *born exportable* (an IOSurface / a DMA-BUF)
-//! and hand the handle across. The GL involvement is confined to this
-//! module's thread; the shell's compositor never touches it.
+//! the consumer-side fix for "no Metal/Vulkan/D3D render API" is to make
+//! the FBO's color attachment *born exportable* (an IOSurface, a
+//! DMA-BUF, a shared DXGI resource) and hand the handle across. The GL
+//! involvement is confined to this module's thread; the shell's
+//! compositor never touches it.
 //!
 //! Pool discipline: a small ring of buffers (default 3) rotates through
 //! free → rendering → published → in-use(shell) → free. mpv renders into
 //! a free buffer, the platform's publish barrier makes it coherent for
 //! other APIs (`glFlush` under IOSurface's coherency contract on macOS,
-//! `glFinish` on Linux — see each platform module), and the newest
-//! published frame replaces an unconsumed older one — the shell always
-//! acquires the latest frame. While the shell holds every buffer,
-//! frames are dropped, not queued.
+//! `glFinish` on Linux, `glFinish` plus the interop unlock on Windows —
+//! see each platform module), and the newest published frame replaces an
+//! unconsumed older one — the shell always acquires the latest frame.
+//! While the shell holds every buffer, frames are dropped, not queued.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -30,6 +33,13 @@ use linux as platform;
 mod macos;
 #[cfg(target_os = "macos")]
 use macos as platform;
+// `self::` is load-bearing on the Windows arm: the `wgpu` feature pulls
+// the `windows` crate into the extern prelude, and a bare `use windows`
+// here would be ambiguous with it.
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+use self::windows as platform;
 #[cfg(all(feature = "wgpu", target_os = "linux"))]
 mod wgpu_linux;
 #[cfg(all(feature = "wgpu", target_os = "macos"))]
@@ -137,9 +147,9 @@ struct PoolState {
     /// pool-size cap counts all of them. Buffers in `retired` have
     /// already left the count.
     live: usize,
-    /// Buffers permanently out of the pool (the Linux wgpu import
-    /// consumes them — see [`retire_buffer`]), parked here for the
-    /// render thread to delete their GL/EGL names on its next wake.
+    /// Buffers permanently out of the pool (the Linux and Windows wgpu
+    /// imports consume them — see [`retire_buffer`]), parked here for
+    /// the render thread to delete their GL names on its next wake.
     /// Always empty on macOS.
     retired: Vec<SurfaceBuffer>,
 }
@@ -389,11 +399,11 @@ fn render_thread(
     drop(gl);
 }
 
-/// Delete the GL/EGL names of buffers retired out of the pool by other
-/// threads (see [`retire_buffer`]) and drop them. Render thread only,
-/// GL context current; dropping also closes the buffer's fd — safe,
-/// because a retired buffer's memory is pinned by the importer's own
-/// reference.
+/// Delete the GL (and EGL / interop) names of buffers retired out of the
+/// pool by other threads (see [`retire_buffer`]) and drop them. Render
+/// thread only, GL context current; dropping also releases the buffer's
+/// own reference on the memory — safe, because a retired buffer's memory
+/// is pinned by the importer's.
 fn drain_retired(shared: &ExportShared, gl: &platform::GlContext) {
     let retired = std::mem::take(&mut shared.state.lock().retired);
     for mut buffer in retired {
@@ -503,17 +513,24 @@ fn render_one(
         height: height as i32,
         internal_format: platform::FBO_INTERNAL_FORMAT,
     };
+    // Hand the buffer's storage to GL (a no-op except on Windows, where
+    // the interop lock is what makes the GL side's write legal) and give
+    // it back in the publish barrier — unconditionally, so a failed
+    // render can't leave a half-handed-over buffer in the pool.
+    gl.begin_render(&buffer);
     // No flip: mpv's unflipped FBO output already puts row 0 at the top
-    // of the image (pinned by the orientation integration tests on both
-    // platforms), which is the layout Metal/CoreVideo/Vulkan consumers
-    // read; flip_y is for GL-convention targets. Block-for-target-time
-    // is mpv's own pacing, harmless on this dedicated thread.
-    if let Err(e) = ctx.render_opengl(fbo, false, true) {
+    // of the image (pinned by the orientation integration tests on every
+    // platform), which is the layout Metal/CoreVideo/Vulkan/D3D
+    // consumers read; flip_y is for GL-convention targets.
+    // Block-for-target-time is mpv's own pacing, harmless on this
+    // dedicated thread.
+    let rendered = ctx.render_opengl(fbo, false, true);
+    gl.publish_barrier(&buffer);
+    if let Err(e) = rendered {
         tracing::warn!("export render failed: {e}");
         shared.state.lock().free.push(buffer);
         return false;
     }
-    gl.publish_barrier();
     {
         let mut state = shared.state.lock();
         if let Some(previous) = state.published.replace(buffer) {
@@ -526,24 +543,25 @@ fn render_one(
 
 /// One rendered video frame, wrapping the exportable buffer the
 /// engine's hidden GL context rendered into — a retained IOSurface on
-/// macOS, a DMA-BUF on Linux. Acquired with
+/// macOS, a DMA-BUF on Linux, a shared D3D11 texture on Windows.
+/// Acquired with
 /// [`Engine::acquire_frame`](crate::Engine::acquire_frame), imported
 /// into the shell's GPU API via the platform handle (`io_surface` on
-/// macOS, `dma_buf_fd` on Linux).
+/// macOS, `dma_buf_fd` on Linux, `shared_handle` on Windows).
 ///
 /// Dropping the frame returns its buffer to the render pool, after which
 /// **mpv will render future frames into the same memory** — hold the
 /// frame until the GPU work sampling it has completed (e.g. until the
 /// command buffer's completion handler / fence), not merely until it
-/// was encoded. Importing the handle into Metal or Vulkan takes its own
-/// reference on the memory, but that only keeps the memory alive; it
+/// was encoded. Importing the handle into Metal, Vulkan or D3D takes its
+/// own reference on the memory, but that only keeps the memory alive; it
 /// does not stop the pool reusing it for pixels.
 ///
 /// With the `wgpu` feature, `into_wgpu_texture` removes that whole
 /// obligation: wgpu's own completion tracking keeps the memory backing
 /// the imported texture out of mpv's hands until wgpu has finished with
 /// it, GPU work included (returned to the pool on macOS, retired from
-/// it on Linux — invisible either way).
+/// it on Linux and Windows — invisible either way).
 pub struct ExportedFrame {
     buffer: Option<SurfaceBuffer>,
     shared: Arc<ExportShared>,
@@ -617,6 +635,36 @@ impl ExportedFrame {
         platform::MODIFIER_LINEAR
     }
 
+    /// The frame's shared NT `HANDLE` for the backing D3D11 texture,
+    /// valid while this frame is alive (see the type docs for the reuse
+    /// hazard after drop). A single-subresource, non-mipmapped 2D
+    /// texture in [`dxgi_format`](Self::dxgi_format).
+    ///
+    /// Open it with `ID3D11Device1::OpenSharedResource1`,
+    /// `ID3D12Device::OpenSharedHandle`, or Vulkan's
+    /// `VK_KHR_external_memory_win32`
+    /// (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT`). All of
+    /// those *duplicate* the handle internally, so — unlike the Linux
+    /// dmabuf fd — nothing here takes ownership and no duplicate is
+    /// needed. The texture deliberately carries **no keyed mutex** (that
+    /// is what lets a plain importer, wgpu included, use it at all);
+    /// ordering comes from the backend's publish barrier, which retires
+    /// mpv's GPU work before the frame is ever handed out.
+    #[cfg(target_os = "windows")]
+    pub fn shared_handle(&self) -> *mut c_void {
+        self.buffer().shared_handle()
+    }
+
+    /// The shared texture's DXGI format — always
+    /// `DXGI_FORMAT_B8G8R8A8_UNORM` (87) with this backend, exposed so
+    /// import code can pass it through instead of hardcoding. The same
+    /// little-endian B,G,R,A bytes as the other platforms:
+    /// `VK_FORMAT_B8G8R8A8_UNORM` / wgpu `Bgra8Unorm`.
+    #[cfg(target_os = "windows")]
+    pub fn dxgi_format(&self) -> u32 {
+        platform::DXGI_FORMAT_BGRA8_UNORM
+    }
+
     /// Frame width in pixels.
     pub fn width(&self) -> u32 {
         self.buffer().size().0
@@ -659,9 +707,10 @@ impl Drop for ExportedFrame {
 
 /// Return an in-use buffer to the pool: the one bookkeeping path shared
 /// by [`ExportedFrame`]'s drop and (on macOS) the wgpu import's drop
-/// callback. After teardown the buffer just idles in `free` until the
-/// shared state drops with it (GL names died with the context; the
-/// backing memory is released by `SurfaceBuffer`'s own drop).
+/// callback. Linux and Windows retire instead — see [`retire_buffer`].
+/// After teardown the buffer just idles in `free` until the shared state
+/// drops with it (GL names died with the context; the backing memory is
+/// released by `SurfaceBuffer`'s own drop).
 fn return_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
     {
         let mut state = shared.state.lock();
@@ -671,15 +720,17 @@ fn return_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
     shared.rearm_dropped_render();
 }
 
-/// Permanently retire an in-use buffer from the pool — the Linux wgpu
-/// import's counterpart to [`return_buffer`]: the dmabuf's memory now
-/// backs a wgpu texture that wgpu releases on its own completion
-/// schedule, so mpv must never render into that memory again (the same
-/// aliasing hazard the macOS drop callback prevents, solved by
-/// consumption instead of reuse). Shrinking `live` lets the render
-/// thread allocate a replacement; the buffer parks in `retired` until
-/// the render thread deletes its GL/EGL names and closes our fd — the
-/// importer holds its own duplicate.
+/// Permanently retire an in-use buffer from the pool — the Linux and
+/// Windows wgpu imports' counterpart to [`return_buffer`]: the buffer's
+/// memory now backs a wgpu texture that wgpu releases on its own
+/// completion schedule, so mpv must never render into that memory again
+/// (the same aliasing hazard the macOS drop callback prevents, solved by
+/// consumption instead of reuse — neither wgpu-hal's dmabuf import nor
+/// its D3D12 `texture_from_raw` offers that callback seam). Shrinking
+/// `live` lets the render thread allocate a replacement; the buffer
+/// parks in `retired` until the render thread deletes its GL names and
+/// releases our own reference on the memory — the importer holds its
+/// own.
 #[cfg(all(feature = "wgpu", target_os = "linux"))]
 fn retire_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
     {

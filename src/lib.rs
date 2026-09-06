@@ -37,17 +37,19 @@
 //! until the frame's target time (right for a toolkit paint handler,
 //! wrong on a compositor thread), and mpv's advanced control (which
 //! obligates [`Engine::render_update`] after every update callback).
-//! On macOS and Linux the non-default `export` feature adds a third,
-//! fully safe backend (`Engine::attach_exported_render`): the engine
-//! renders on a hidden GL context of its own and hands the shell
+//! On macOS, Linux and Windows the non-default `export` feature adds a
+//! third, fully safe backend (`Engine::attach_exported_render`): the
+//! engine renders on a hidden GL context of its own and hands the shell
 //! zero-copy exportable frames (`ExportedFrame` — IOSurface-backed on
-//! macOS, DMA-BUF-backed on Linux) for Metal / Vulkan / wgpu import —
-//! no GL and no pixel copies in the shell. The `wgpu` feature (implies
+//! macOS, DMA-BUF-backed on Linux, shared-D3D11-texture-backed on
+//! Windows) for Metal / Vulkan / D3D / wgpu import — no GL and no pixel
+//! copies in the shell. The `wgpu` feature (implies
 //! `export`, wgpu-major-locked) adds
 //! `ExportedFrame::into_wgpu_texture`,
 //! which wraps the frame as a `wgpu::Texture` on the shell's device
-//! (Metal on macOS, Vulkan on Linux) and leaves the frame's memory in
-//! wgpu's own GPU-completion tracking — no manual hold-until-done.
+//! (Metal on macOS, Vulkan on Linux, DX12 on Windows) and leaves the
+//! frame's memory in wgpu's own GPU-completion tracking — no manual
+//! hold-until-done.
 //! Event delivery is pull-based
 //! ([`Engine::pump_events`]) with an optional push signal
 //! ([`Engine::set_wakeup_callback`]) for shells that don't want a
@@ -79,7 +81,10 @@
 
 mod engine;
 mod error;
-#[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "export",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 mod export;
 mod render;
 
@@ -88,6 +93,9 @@ pub use engine::{
     PropertyValue,
 };
 pub use error::{Error, Result};
-#[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "export",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 pub use export::{ExportOptions, ExportedFrame};
 pub use render::{GlRenderOptions, ProcAddressFn, RenderKind};

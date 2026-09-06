@@ -17,13 +17,15 @@ categories = ["multimedia::video"]
 # README "Roadmap".
 
 [features]
-# Exported-frame render backend (macOS + Linux): the engine owns a hidden
-# GL context on a dedicated render thread (CGL / surfaceless EGL over a
-# DRM render node), renders into exportable framebuffers (IOSurface /
-# DMA-BUF), and hands the shell zero-copy frame handles for Metal /
-# Vulkan / wgpu import. Links the OpenGL, IOSurface and CoreFoundation
-# frameworks (macOS) or libEGL and libgbm (Linux) directly — no new Rust
-# dependencies, per the policy above. On other platforms the feature
+# Exported-frame render backend (macOS + Linux + Windows): the engine
+# owns a hidden GL context on a dedicated render thread (CGL /
+# surfaceless EGL over a DRM render node / WGL on an invisible window),
+# renders into exportable framebuffers (IOSurface / DMA-BUF / shared
+# D3D11 texture), and hands the shell zero-copy frame handles for Metal /
+# Vulkan / D3D / wgpu import. Links the OpenGL, IOSurface and
+# CoreFoundation frameworks (macOS), libEGL and libgbm (Linux), or
+# opengl32, d3d11, dxgi, user32 and gdi32 (Windows) directly — no new
+# Rust dependencies, per the policy above. On other platforms the feature
 # compiles to nothing.
 export = []
 # Zero-copy import of ExportedFrame into wgpu (implies `export`; macOS →

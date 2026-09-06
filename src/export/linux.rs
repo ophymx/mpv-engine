@@ -435,6 +435,12 @@ impl GlContext {
         Ok(())
     }
 
+    /// Nothing to hand over before mpv renders: a dmabuf-backed GL
+    /// texture is always the render thread's to write. (Windows, whose
+    /// exportable storage lives behind a `WGL_NV_DX_interop2` lock, is
+    /// why the cross-platform seam has this call at all.)
+    pub(crate) fn begin_render(&self, _buffer: &SurfaceBuffer) {}
+
     /// Publish barrier before a DMA-BUF is consumed by another API.
     /// Unlike IOSurface's flush-coherency contract on macOS, a DMA-BUF
     /// carries no cross-API ordering guarantee a mere `glFlush` would
@@ -443,7 +449,7 @@ impl GlContext {
     /// completion is guaranteed the blunt way: `glFinish` on this
     /// dedicated thread, so a published frame's pixels are already on
     /// the bus when the shell sees it and no consumer-side wait exists.
-    pub(crate) fn publish_barrier(&self) {
+    pub(crate) fn publish_barrier(&self, _buffer: &SurfaceBuffer) {
         unsafe { (self.fns.Finish)() };
     }
 }

@@ -2,7 +2,10 @@
 //! pool/thread logic in `src/export/mod.rs`), run against whichever
 //! platform's real GL context this box has. Regression tests for review
 //! findings; skips like the other export suites.
-#![cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+#![cfg(all(
+    feature = "export",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 
 mod common;
 

@@ -194,12 +194,18 @@ impl GlContext {
         Ok(())
     }
 
+    /// Nothing to hand over before mpv renders: an IOSurface-backed GL
+    /// texture is always the render thread's to write. (Windows, whose
+    /// exportable storage lives behind a `WGL_NV_DX_interop2` lock, is
+    /// why the cross-platform seam has this call at all.)
+    pub(crate) fn begin_render(&self, _buffer: &SurfaceBuffer) {}
+
     /// Publish barrier before an IOSurface is sampled from another API:
     /// IOSurface guarantees cross-API coherency only once the producing
     /// GL context flushes (a full `glFinish` stall is *not* required —
-    /// don't "strengthen" this; the Linux backend finishes for DMA-BUF
-    /// reasons of its own).
-    pub(crate) fn publish_barrier(&self) {
+    /// don't "strengthen" this; the Linux and Windows backends finish
+    /// for reasons of their own).
+    pub(crate) fn publish_barrier(&self, _buffer: &SurfaceBuffer) {
         unsafe { glFlush() };
     }
 }

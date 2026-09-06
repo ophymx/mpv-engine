@@ -5,7 +5,10 @@ use parking_lot::Mutex;
 use rsmpv::{EndFileReason, Event, Format, Mpv, PropertyData, sys};
 
 use crate::error::{Error, Result, describe_code};
-#[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "export",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 use crate::export::{ExportOptions, ExportedFrame, ExportedRender};
 use crate::render::{
     GlRender, GlRenderOptions, ProcAddressFn, RenderBackend, RenderKind, SwRender,
@@ -251,7 +254,10 @@ impl EngineBuilder {
         Ok(Engine {
             render: Mutex::new(None),
             attach: Mutex::new(()),
-            #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+            #[cfg(all(
+                feature = "export",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
             orphaned_render: Mutex::new(None),
             pump: Mutex::new(()),
             next_observe_id: AtomicU64::new(1),
@@ -289,7 +295,10 @@ pub struct Engine {
     /// attach / detach / engine drop on another thread joins the
     /// deferred teardown — instead of leaving the thread's GL/mpv
     /// teardown to race process exit forever.
-    #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(
+        feature = "export",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
     orphaned_render: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Keeps each [`pump_events`](Engine::pump_events) drain atomic.
     /// rsmpv's `poll_event` is safe to call concurrently, but concurrent
@@ -775,7 +784,10 @@ impl Engine {
         // Join any teardown deferred by a detach-from-`on_update` before
         // creating a context: the orphaned thread frees the old mpv
         // render context on exit, and libmpv allows only one per core.
-        #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+        #[cfg(all(
+            feature = "export",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        ))]
         self.join_orphaned_render();
         if self.render.lock().is_some() {
             return Err(Error::AlreadyAttached);
@@ -832,7 +844,10 @@ impl Engine {
     pub fn attach_sw_render(&self, on_update: impl Fn() + Send + Sync + 'static) -> Result<()> {
         // Same locking shape as `attach_gl_render`, for the same reasons.
         let _attaching = self.attach.lock();
-        #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+        #[cfg(all(
+            feature = "export",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        ))]
         self.join_orphaned_render();
         if self.render.lock().is_some() {
             return Err(Error::AlreadyAttached);
@@ -950,14 +965,20 @@ impl Engine {
             // thread; join that deferred teardown first (under the
             // attach lock, so it is fully over before this detach's own
             // backend drop and any subsequent attach).
-            #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+            #[cfg(all(
+                feature = "export",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
             self.join_orphaned_render();
             Some(attaching)
         };
         let (taken, displaced) = {
             let mut slot = self.render.lock();
             #[cfg_attr(
-                not(all(feature = "export", any(target_os = "macos", target_os = "linux"))),
+                not(all(
+                    feature = "export",
+                    any(target_os = "macos", target_os = "linux", target_os = "windows")
+                )),
                 allow(unused_mut)
             )]
             let mut taken = slot.take();
@@ -969,7 +990,10 @@ impl Engine {
             // than racing the deferred teardown. (A still-parked older
             // orphan, if any, has long exited and drops detached —
             // exactly its pre-parking fate.)
-            #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+            #[cfg(all(
+                feature = "export",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
             if on_render_thread {
                 if let Some(RenderBackend::Exported(render)) = taken.as_mut() {
                     *self.orphaned_render.lock() = render.take_thread();
@@ -1010,7 +1034,10 @@ impl Engine {
     /// *on* the orphaned thread itself (another engine call from that
     /// same callback), the handle stays parked for a real joiner —
     /// self-joining would deadlock.
-    #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(
+        feature = "export",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
     fn join_orphaned_render(&self) {
         let mut parked = self.orphaned_render.lock();
         if let Some(handle) = parked.take() {
@@ -1157,9 +1184,10 @@ impl Engine {
     /// Create the exported-frame render backend (`export` feature): the
     /// engine spawns a render thread owning a hidden GL context, mpv
     /// renders there into exportable framebuffers (IOSurface-backed on
-    /// macOS, DMA-BUF-backed on Linux), and the shell pulls zero-copy
-    /// [`ExportedFrame`]s with [`acquire_frame`](Self::acquire_frame) to
-    /// import into Metal / Vulkan / wgpu.
+    /// macOS, DMA-BUF-backed on Linux, shared-D3D11-texture-backed on
+    /// Windows), and the shell pulls zero-copy [`ExportedFrame`]s with
+    /// [`acquire_frame`](Self::acquire_frame) to import into Metal /
+    /// Vulkan / D3D / wgpu.
     /// Fully safe — no GL context or currency contract crosses this API;
     /// the thread that creates the context is the thread that renders on
     /// it and frees it.
@@ -1197,9 +1225,13 @@ impl Engine {
     ///
     /// Errors with [`Error::ExportSetup`] when no GL context can be
     /// created — typically a session without GPU access (no
-    /// WindowServer on macOS, no readable DRM render node on Linux);
-    /// treat it like a missing display.
-    #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+    /// WindowServer on macOS, no readable DRM render node on Linux, no
+    /// OpenGL ICD or no `WGL_NV_DX_interop2` on Windows); treat it like
+    /// a missing display.
+    #[cfg(all(
+        feature = "export",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
     pub fn attach_exported_render(
         &self,
         options: ExportOptions,
@@ -1246,7 +1278,10 @@ impl Engine {
     /// [`Error::RenderBackendMismatch`] when a different backend is
     /// attached. Callable from any thread, including from inside the
     /// exported backend's `on_update`.
-    #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(
+        feature = "export",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
     pub fn acquire_frame(&self) -> Result<Option<ExportedFrame>> {
         // Clone the shared state out under a short slot lock; the take
         // itself must not hold the render lock (an attach/detach could
@@ -1270,7 +1305,10 @@ impl Engine {
     /// No-op `Ok` when nothing is attached;
     /// [`Error::RenderBackendMismatch`] for a different backend.
     /// Outstanding [`ExportedFrame`]s keep their original size.
-    #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(
+        feature = "export",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
     pub fn set_export_size(&self, width: u32, height: u32) -> Result<()> {
         match self.render.lock().as_ref() {
             Some(RenderBackend::Exported(r)) => {
@@ -1293,7 +1331,10 @@ impl Engine {
 // memory.) The `export` Drop below only joins a parked render thread —
 // it manages no resource the field drops don't already cover.
 
-#[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "export",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 impl Drop for Engine {
     fn drop(&mut self) {
         // A detach-from-`on_update` parks its render thread's handle

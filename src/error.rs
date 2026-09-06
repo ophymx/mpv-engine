@@ -18,24 +18,33 @@ pub enum Error {
     #[error("render call does not match the attached render backend")]
     RenderBackendMismatch,
     /// Setting up the exported-frame backend's hidden GL context or its
-    /// exportable framebuffers (IOSurface / DMA-BUF) failed (`export`
-    /// feature,
+    /// exportable framebuffers (IOSurface / DMA-BUF / shared D3D11
+    /// texture) failed (`export` feature,
     /// [`Engine::attach_exported_render`](crate::Engine::attach_exported_render)).
     /// The common non-bug cause is a session without GPU access —
     /// no WindowServer on macOS, no readable DRM render node on Linux
-    /// (SSH, bare CI, missing render/video group) — treat it like a
-    /// missing display and fall back to another backend or skip.
-    #[cfg(all(feature = "export", any(target_os = "macos", target_os = "linux")))]
+    /// (SSH, bare CI, missing render/video group), no OpenGL ICD or no
+    /// `WGL_NV_DX_interop2` on Windows — treat it like a missing display
+    /// and fall back to another backend or skip.
+    #[cfg(all(
+        feature = "export",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
     #[error("exported render setup: {0}")]
     ExportSetup(String),
     /// Importing an exported frame into a wgpu device failed (`wgpu`
     /// feature,
     /// [`ExportedFrame::into_wgpu_texture`](crate::ExportedFrame::into_wgpu_texture))
     /// — the device isn't on the platform's native backend (Metal on
-    /// macOS, Vulkan on Linux), lacks a required wgpu feature
-    /// (`VULKAN_EXTERNAL_MEMORY_DMA_BUF` on Linux), or the driver
-    /// refused the IOSurface wrap / DMA-BUF import.
-    #[cfg(all(feature = "wgpu", any(target_os = "macos", target_os = "linux")))]
+    /// macOS, Vulkan on Linux, DX12 on Windows), lacks a required wgpu
+    /// feature (`VULKAN_EXTERNAL_MEMORY_DMA_BUF` on Linux), sits on a
+    /// different GPU than the engine's hidden context (Windows), or the
+    /// driver refused the IOSurface wrap / DMA-BUF import / shared-handle
+    /// open.
+    #[cfg(all(
+        feature = "wgpu",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
     #[error("wgpu import: {0}")]
     WgpuImport(String),
     /// A call that needs a live render context ran before any attach.
