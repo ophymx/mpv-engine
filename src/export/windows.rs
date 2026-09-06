@@ -58,6 +58,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
+use super::{ExportBackend, ExportBuffer};
 use crate::error::{Error, Result};
 
 // ---- Win32 base types ----
@@ -205,12 +206,6 @@ use super::gl_consts::{
     GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE, GL_NEAREST, GL_RGBA8,
     GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
 };
-
-/// The FBO color format reported to mpv (`OpenGlFbo::internal_format`).
-/// A hint only — the real storage layout is fixed by the D3D11 texture's
-/// `DXGI_FORMAT_B8G8R8A8_UNORM`, which GL learns through the interop
-/// registration.
-pub(crate) const FBO_INTERNAL_FORMAT: i32 = GL_RGBA8 as i32;
 
 /// `DXGI_FORMAT_B8G8R8A8_UNORM`: little-endian B,G,R,A bytes — the
 /// layout Vulkan calls `B8G8R8A8_UNORM` and wgpu calls `Bgra8Unorm`,
@@ -740,58 +735,6 @@ impl GlContext {
     /// test, not the dimensions.
     const PROBE_SIZE: u32 = 64;
 
-    /// Bring the backend up on the first adapter that actually *works*.
-    /// A GL context and a D3D11 device that each come up fine can still
-    /// refuse to interop when they landed on different GPUs — the
-    /// ordinary case on a hybrid laptop, where the GL ICD picks the
-    /// discrete chip while DXGI's adapter 0 is the integrated one — so
-    /// every failure falls through to the next adapter (the same
-    /// device-selection discipline as the Linux backend's render-node
-    /// ladder) rather than failing the attach.
-    ///
-    /// "Works" has to mean a *registered buffer*, not an opened interop
-    /// device. `wglDXOpenDeviceNV` returns a live handle for a
-    /// mismatched GL/D3D pair on at least some ICDs, and the rejection
-    /// only lands later, on the first `wglDXRegisterObjectNV`. Accepting
-    /// an adapter on the open alone therefore produces the worst
-    /// possible outcome: an attach that reports success, and a render
-    /// loop that retries the failing allocation forever without ever
-    /// publishing a frame. Each candidate is proved with a throwaway
-    /// buffer here instead, so a bad adapter is a fall-through and total
-    /// failure is an honest `ExportSetup` error the shell can see.
-    pub(crate) fn new() -> Result<Self> {
-        let adapters = enumerate_adapters();
-        // The null entry is the "let D3D11 pick" fallback, so a box
-        // whose DXGI factory refused to enumerate still gets one try.
-        let candidates: Vec<*mut c_void> = if adapters.is_empty() {
-            vec![std::ptr::null_mut()]
-        } else {
-            adapters.clone()
-        };
-        let mut last_error = None;
-        let mut opened = None;
-        for adapter in candidates {
-            match Self::try_adapter(adapter) {
-                Ok(context) => {
-                    opened = Some(context);
-                    break;
-                }
-                Err(e) => {
-                    tracing::debug!("export: adapter unusable for GL interop: {e}");
-                    last_error = Some(e);
-                }
-            }
-        }
-        for adapter in adapters {
-            unsafe { com_release(adapter) };
-        }
-        opened.ok_or_else(|| {
-            last_error.unwrap_or_else(|| {
-                Error::ExportSetup("no D3D11 adapter could be opened for GL interop".into())
-            })
-        })
-    }
-
     /// One rung of the ladder: the whole backend on one adapter, proved
     /// end to end. The window and GL context are rebuilt per candidate
     /// rather than shared across the loop so that a rejected rung tears
@@ -867,8 +810,70 @@ impl GlContext {
         probe.delete_gl(&gl);
         Ok(gl)
     }
+}
 
-    pub(crate) fn make_current(&self) -> Result<()> {
+impl ExportBackend for GlContext {
+    type Buffer = SurfaceBuffer;
+
+    /// The FBO color format reported to mpv (`OpenGlFbo::internal_format`).
+    /// A hint only — the real storage layout is fixed by the D3D11 texture's
+    /// `DXGI_FORMAT_B8G8R8A8_UNORM`, which GL learns through the interop
+    /// registration.
+    const FBO_INTERNAL_FORMAT: i32 = GL_RGBA8 as i32;
+
+    /// Bring the backend up on the first adapter that actually *works*.
+    /// A GL context and a D3D11 device that each come up fine can still
+    /// refuse to interop when they landed on different GPUs — the
+    /// ordinary case on a hybrid laptop, where the GL ICD picks the
+    /// discrete chip while DXGI's adapter 0 is the integrated one — so
+    /// every failure falls through to the next adapter (the same
+    /// device-selection discipline as the Linux backend's render-node
+    /// ladder) rather than failing the attach.
+    ///
+    /// "Works" has to mean a *registered buffer*, not an opened interop
+    /// device. `wglDXOpenDeviceNV` returns a live handle for a
+    /// mismatched GL/D3D pair on at least some ICDs, and the rejection
+    /// only lands later, on the first `wglDXRegisterObjectNV`. Accepting
+    /// an adapter on the open alone therefore produces the worst
+    /// possible outcome: an attach that reports success, and a render
+    /// loop that retries the failing allocation forever without ever
+    /// publishing a frame. Each candidate is proved with a throwaway
+    /// buffer here instead, so a bad adapter is a fall-through and total
+    /// failure is an honest `ExportSetup` error the shell can see.
+    fn new() -> Result<Self> {
+        let adapters = enumerate_adapters();
+        // The null entry is the "let D3D11 pick" fallback, so a box
+        // whose DXGI factory refused to enumerate still gets one try.
+        let candidates: Vec<*mut c_void> = if adapters.is_empty() {
+            vec![std::ptr::null_mut()]
+        } else {
+            adapters.clone()
+        };
+        let mut last_error = None;
+        let mut opened = None;
+        for adapter in candidates {
+            match Self::try_adapter(adapter) {
+                Ok(context) => {
+                    opened = Some(context);
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!("export: adapter unusable for GL interop: {e}");
+                    last_error = Some(e);
+                }
+            }
+        }
+        for adapter in adapters {
+            unsafe { com_release(adapter) };
+        }
+        opened.ok_or_else(|| {
+            last_error.unwrap_or_else(|| {
+                Error::ExportSetup("no D3D11 adapter could be opened for GL interop".into())
+            })
+        })
+    }
+
+    fn make_current(&self) -> Result<()> {
         if unsafe { wglMakeCurrent(self.window.hdc, self.hglrc) } == 0 {
             return Err(Error::ExportSetup("wglMakeCurrent failed".into()));
         }
@@ -885,7 +890,7 @@ impl GlContext {
     ///
     /// A no-op on macOS and Linux, whose exportable memory needs no
     /// handover.
-    pub(crate) fn begin_render(&self, buffer: &SurfaceBuffer) {
+    fn begin_render(&self, buffer: &SurfaceBuffer) {
         buffer.lock_for_gl(self);
     }
 
@@ -899,10 +904,14 @@ impl GlContext {
     /// the copy that follows is legal. [`SurfaceBuffer::copy_to_shared`]
     /// then fills the export texture and flushes, which is what makes
     /// the handle's openers see finished pixels.
-    pub(crate) fn publish_barrier(&self, buffer: &SurfaceBuffer) {
+    fn publish_barrier(&self, buffer: &SurfaceBuffer) {
         unsafe { glFinish() };
         buffer.unlock_from_gl(self);
         buffer.copy_to_shared();
+    }
+
+    fn proc_address(name: &str) -> *mut c_void {
+        gl_proc_address(name)
     }
 }
 
@@ -965,10 +974,12 @@ pub(crate) struct SurfaceBuffer {
 unsafe impl Send for SurfaceBuffer {}
 unsafe impl Sync for SurfaceBuffer {}
 
-impl SurfaceBuffer {
+impl ExportBuffer for SurfaceBuffer {
+    type Backend = GlContext;
+
     /// Create a `width`×`height` buffer. Render thread only, GL context
     /// current.
-    pub(crate) fn new(gl: &GlContext, width: u32, height: u32) -> Result<Self> {
+    fn new(gl: &GlContext, width: u32, height: u32) -> Result<Self> {
         let interop_texture =
             create_shared_texture(gl.d3d.device, width, height, D3D11_MISC_SHARED)?;
         let texture =
@@ -1055,65 +1066,12 @@ impl SurfaceBuffer {
         Ok(buffer)
     }
 
-    /// Take the interop object for GL, idempotently — re-locking a
-    /// locked object is an error in the extension, and the render path
-    /// pairs lock/unlock across a *fallible* mpv render.
-    fn lock_for_gl(&self, gl: &GlContext) {
-        if self.dx_object.is_null() || self.locked.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let mut object = self.dx_object;
-        // Under the immediate-context mutex: the ICD implements the lock
-        // by driving the D3D11 immediate context, which `copy_pixels`
-        // may be using from the shell's thread at this very moment (it
-        // runs on every acquired frame). Racing the two hangs the render
-        // thread inside the driver — see `D3d11::context`.
-        let _ctx = self.d3d.context.lock();
-        if unsafe { (gl.fns.DXLockObjects)(gl.dx_device, 1, &mut object) } == 0 {
-            tracing::warn!("export: wglDXLockObjectsNV failed; this frame may be stale");
-        }
-    }
-
-    /// Hand the interop object back to D3D, idempotently.
-    fn unlock_from_gl(&self, gl: &GlContext) {
-        if self.dx_object.is_null() || !self.locked.swap(false, Ordering::SeqCst) {
-            return;
-        }
-        let mut object = self.dx_object;
-        // Same immediate-context serialization as `lock_for_gl`.
-        let _ctx = self.d3d.context.lock();
-        if unsafe { (gl.fns.DXUnlockObjects)(gl.dx_device, 1, &mut object) } == 0 {
-            tracing::warn!("export: wglDXUnlockObjectsNV failed; this frame may be torn");
-        }
-    }
-
-    /// Fill the export texture from the one GL just rendered into.
-    /// Called by the publish barrier *after* the interop unlock, because
-    /// D3D may only touch a registered resource while it is unlocked.
-    ///
-    /// The `Flush` is not optional: the consumer opens the shared handle
-    /// on a *different* device, and with no keyed mutex in play nothing
-    /// else forces this copy out of the immediate context's queue before
-    /// that device reads the texture.
-    fn copy_to_shared(&self) {
-        let ctx = self.d3d.context.lock();
-        unsafe {
-            let v = vtbl::<ID3D11DeviceContextVtbl>(*ctx);
-            (v.copy_resource)(*ctx, self.texture, self.interop_texture);
-            (v.flush)(*ctx);
-        }
-    }
-
-    pub(crate) fn fbo(&self) -> u32 {
+    fn fbo(&self) -> u32 {
         self.fbo
     }
 
-    pub(crate) fn size(&self) -> (u32, u32) {
+    fn size(&self) -> (u32, u32) {
         (self.width, self.height)
-    }
-
-    pub(crate) fn shared_handle(&self) -> Handle {
-        self.handle
     }
 
     /// Delete the GL texture/framebuffer names and the interop
@@ -1121,7 +1079,7 @@ impl SurfaceBuffer {
     /// texture and its shared handle are released by `Drop` (any
     /// thread). Buffers retired anywhere else simply skip this — their
     /// GL name and interop object die with the render thread's context.
-    pub(crate) fn delete_gl(&mut self, gl: &GlContext) {
+    fn delete_gl(&mut self, gl: &GlContext) {
         // Unregistering a locked object is invalid, and a buffer can
         // reach here locked if mpv's render errored out mid-frame.
         self.unlock_from_gl(gl);
@@ -1151,7 +1109,7 @@ impl SurfaceBuffer {
     /// keeps the device alive). Returns zeroed pixels if the staging
     /// copy or the map fails, mirroring the other platforms'
     /// lock-failure behavior.
-    pub(crate) fn copy_pixels(&self) -> Vec<u8> {
+    fn copy_pixels(&self) -> Vec<u8> {
         let (w, h) = (self.width as usize, self.height as usize);
         if w == 0 || h == 0 {
             return vec![0u8; w * h * 4];
@@ -1210,6 +1168,66 @@ impl SurfaceBuffer {
             com_release(staging);
             out
         }
+    }
+}
+
+impl SurfaceBuffer {
+    /// Take the interop object for GL, idempotently — re-locking a
+    /// locked object is an error in the extension, and the render path
+    /// pairs lock/unlock across a *fallible* mpv render.
+    fn lock_for_gl(&self, gl: &GlContext) {
+        if self.dx_object.is_null() || self.locked.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut object = self.dx_object;
+        // Under the immediate-context mutex: the ICD implements the lock
+        // by driving the D3D11 immediate context, which `copy_pixels`
+        // may be using from the shell's thread at this very moment (it
+        // runs on every acquired frame). Racing the two hangs the render
+        // thread inside the driver — see `D3d11::context`.
+        let _ctx = self.d3d.context.lock();
+        if unsafe { (gl.fns.DXLockObjects)(gl.dx_device, 1, &mut object) } == 0 {
+            tracing::warn!("export: wglDXLockObjectsNV failed; this frame may be stale");
+        }
+    }
+
+    /// Hand the interop object back to D3D, idempotently.
+    fn unlock_from_gl(&self, gl: &GlContext) {
+        if self.dx_object.is_null() || !self.locked.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let mut object = self.dx_object;
+        // Same immediate-context serialization as `lock_for_gl`.
+        let _ctx = self.d3d.context.lock();
+        if unsafe { (gl.fns.DXUnlockObjects)(gl.dx_device, 1, &mut object) } == 0 {
+            tracing::warn!("export: wglDXUnlockObjectsNV failed; this frame may be torn");
+        }
+    }
+
+    /// Fill the export texture from the one GL just rendered into.
+    /// Called by the publish barrier *after* the interop unlock, because
+    /// D3D may only touch a registered resource while it is unlocked.
+    ///
+    /// The `Flush` is not optional: the consumer opens the shared handle
+    /// on a *different* device, and with no keyed mutex in play nothing
+    /// else forces this copy out of the immediate context's queue before
+    /// that device reads the texture.
+    fn copy_to_shared(&self) {
+        let ctx = self.d3d.context.lock();
+        unsafe {
+            let v = vtbl::<ID3D11DeviceContextVtbl>(*ctx);
+            (v.copy_resource)(*ctx, self.texture, self.interop_texture);
+            (v.flush)(*ctx);
+        }
+    }
+
+    /// Windows's platform-native export accessor: the shared NT `HANDLE`.
+    /// Deliberately outside the [`ExportBuffer`](super::ExportBuffer)
+    /// contract — each platform's export currency differs — and used only
+    /// by the Windows wgpu import and the frame's public `shared_handle`
+    /// accessor.
+    pub(crate) fn shared_handle(&self) -> Handle {
+        self.handle
     }
 }
 
@@ -1313,7 +1331,7 @@ fn create_shared_handle(texture: *mut c_void) -> Result<Handle> {
 /// from `wglGetProcAddress` for the latter, so those sentinels are
 /// filtered too. A loader doing only one half silently fails mpv on half
 /// its symbol requests (the Windows twin of the README's libepoxy note).
-pub(crate) fn gl_proc_address(name: &str) -> *mut c_void {
+fn gl_proc_address(name: &str) -> *mut c_void {
     let Ok(cname) = CString::new(name) else {
         return std::ptr::null_mut();
     };

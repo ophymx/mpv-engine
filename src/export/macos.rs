@@ -12,6 +12,7 @@
 
 use std::ffi::{CString, c_char, c_void};
 
+use super::{ExportBackend, ExportBuffer};
 use crate::error::{Error, Result};
 
 type CFTypeRef = *const c_void;
@@ -91,9 +92,6 @@ const GL_RGBA: u32 = 0x1908;
 const GL_BGRA: u32 = 0x80E1;
 const GL_UNSIGNED_INT_8_8_8_8_REV: u32 = 0x8367;
 
-/// The FBO color format reported to mpv (`OpenGlFbo::internal_format`).
-pub(crate) const FBO_INTERNAL_FORMAT: i32 = GL_RGBA8 as i32;
-
 #[link(name = "OpenGL", kind = "framework")]
 unsafe extern "C" {
     fn CGLChoosePixelFormat(
@@ -158,8 +156,13 @@ pub(crate) struct GlContext {
     ctx: CGLContextObj,
 }
 
-impl GlContext {
-    pub(crate) fn new() -> Result<Self> {
+impl ExportBackend for GlContext {
+    type Buffer = SurfaceBuffer;
+
+    /// The FBO color format reported to mpv (`OpenGlFbo::internal_format`).
+    const FBO_INTERNAL_FORMAT: i32 = GL_RGBA8 as i32;
+
+    fn new() -> Result<Self> {
         for profile in [
             CGL_PROFILE_GL4_CORE,
             CGL_PROFILE_GL3_CORE,
@@ -185,7 +188,7 @@ impl GlContext {
         ))
     }
 
-    pub(crate) fn make_current(&self) -> Result<()> {
+    fn make_current(&self) -> Result<()> {
         let code = unsafe { CGLSetCurrentContext(self.ctx) };
         if code != 0 {
             return Err(cgl_error("CGLSetCurrentContext", code));
@@ -197,15 +200,25 @@ impl GlContext {
     /// texture is always the render thread's to write. (Windows, whose
     /// exportable storage lives behind a `WGL_NV_DX_interop2` lock, is
     /// why the cross-platform seam has this call at all.)
-    pub(crate) fn begin_render(&self, _buffer: &SurfaceBuffer) {}
+    fn begin_render(&self, _buffer: &SurfaceBuffer) {}
 
     /// Publish barrier before an IOSurface is sampled from another API:
     /// IOSurface guarantees cross-API coherency only once the producing
     /// GL context flushes (a full `glFinish` stall is *not* required —
     /// don't "strengthen" this; the Linux and Windows backends finish
     /// for reasons of their own).
-    pub(crate) fn publish_barrier(&self, _buffer: &SurfaceBuffer) {
+    fn publish_barrier(&self, _buffer: &SurfaceBuffer) {
         unsafe { glFlush() };
+    }
+
+    /// mpv's GL loader for the hidden context: OpenGL.framework is linked
+    /// into the process, so every GL entry point resolves through a plain
+    /// `dlsym` — no windowing-toolkit loader involved.
+    fn proc_address(name: &str) -> *mut c_void {
+        let Ok(cname) = CString::new(name) else {
+            return std::ptr::null_mut();
+        };
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) }
     }
 }
 
@@ -239,11 +252,13 @@ pub(crate) struct SurfaceBuffer {
 unsafe impl Send for SurfaceBuffer {}
 unsafe impl Sync for SurfaceBuffer {}
 
-impl SurfaceBuffer {
+impl ExportBuffer for SurfaceBuffer {
+    type Backend = GlContext;
+
     /// Create a `width`×`height` buffer. Render thread only, GL context
     /// current (`_gl` is the cross-platform signature; CGL resolves the
     /// current context itself).
-    pub(crate) fn new(_gl: &GlContext, width: u32, height: u32) -> Result<Self> {
+    fn new(_gl: &GlContext, width: u32, height: u32) -> Result<Self> {
         let surface = create_iosurface(width, height)?;
         let cgl = unsafe { CGLGetCurrentContext() };
         let mut texture: u32 = 0;
@@ -323,23 +338,19 @@ impl SurfaceBuffer {
         })
     }
 
-    pub(crate) fn fbo(&self) -> u32 {
+    fn fbo(&self) -> u32 {
         self.fbo
     }
 
-    pub(crate) fn size(&self) -> (u32, u32) {
+    fn size(&self) -> (u32, u32) {
         (self.width, self.height)
-    }
-
-    pub(crate) fn io_surface(&self) -> IOSurfaceRef {
-        self.surface
     }
 
     /// Delete the GL texture/framebuffer names. Render thread only, GL
     /// context current; the IOSurface itself is released by `Drop` (any
     /// thread). Buffers retired anywhere else simply skip this — their
     /// GL names die with the render thread's context.
-    pub(crate) fn delete_gl(&mut self, _gl: &GlContext) {
+    fn delete_gl(&mut self, _gl: &GlContext) {
         unsafe {
             if self.fbo != 0 {
                 glDeleteFramebuffers(1, &self.fbo);
@@ -354,7 +365,7 @@ impl SurfaceBuffer {
 
     /// Copy the surface's pixels out as tightly packed BGRA rows
     /// (row 0 = top). Any thread.
-    pub(crate) fn copy_pixels(&self) -> Vec<u8> {
+    fn copy_pixels(&self) -> Vec<u8> {
         let (w, h) = (self.width as usize, self.height as usize);
         unsafe {
             if IOSurfaceLock(self.surface, IOSURFACE_LOCK_READ_ONLY, std::ptr::null_mut()) != 0 {
@@ -372,6 +383,16 @@ impl SurfaceBuffer {
             IOSurfaceUnlock(self.surface, IOSURFACE_LOCK_READ_ONLY, std::ptr::null_mut());
             out
         }
+    }
+}
+
+/// macOS's platform-native export accessor: the retained `IOSurfaceRef`.
+/// Deliberately outside the [`ExportBuffer`](super::ExportBuffer) contract
+/// — each platform's export currency differs — and used only by the macOS
+/// wgpu import and the frame's public `io_surface` accessor.
+impl SurfaceBuffer {
+    pub(crate) fn io_surface(&self) -> IOSurfaceRef {
+        self.surface
     }
 }
 
@@ -443,14 +464,4 @@ fn create_iosurface(width: u32, height: u32) -> Result<IOSurfaceRef> {
         }
         Ok(surface)
     }
-}
-
-/// mpv's GL loader for the hidden context: OpenGL.framework is linked
-/// into the process, so every GL entry point resolves through a plain
-/// `dlsym` — no windowing-toolkit loader involved.
-pub(crate) fn gl_proc_address(name: &str) -> *mut c_void {
-    let Ok(cname) = CString::new(name) else {
-        return std::ptr::null_mut();
-    };
-    unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) }
 }

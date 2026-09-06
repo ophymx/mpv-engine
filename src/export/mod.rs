@@ -79,6 +79,86 @@ mod gl_consts {
     pub(crate) const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
 }
 
+/// The contract every platform backend satisfies — the normative spec for
+/// the `cfg`-selected `platform` module (`use linux as platform`), split
+/// across an owning GL context ([`ExportBackend`]) and the exportable
+/// buffers it renders into ([`ExportBuffer`]). Only one implementation
+/// ever compiles, so these traits exist for documentation and a
+/// compile-time check that each backend matches the shape `mod.rs` drives
+/// — not for runtime polymorphism.
+///
+/// # Thread discipline (part of the contract)
+/// [`ExportBackend::new`], [`make_current`](ExportBackend::make_current),
+/// [`begin_render`](ExportBackend::begin_render),
+/// [`publish_barrier`](ExportBackend::publish_barrier),
+/// [`ExportBuffer::new`] and [`delete_gl`](ExportBuffer::delete_gl) run
+/// **only on the export render thread**, with the context current — that
+/// is what lets each implementation uphold GL's thread rules by
+/// construction. [`copy_pixels`](ExportBuffer::copy_pixels) may be called
+/// from any thread (it must not touch GL). `Drop` may run on any thread
+/// once the GL names are gone.
+pub(crate) trait ExportBackend: Sized {
+    /// The exportable buffers this backend allocates and renders into.
+    type Buffer: ExportBuffer<Backend = Self>;
+
+    /// The FBO color format reported to mpv
+    /// (`OpenGlFbo::internal_format`). A hint only — the real storage
+    /// layout is fixed by the exportable memory's own format.
+    const FBO_INTERNAL_FORMAT: i32;
+
+    /// Bring up the hidden, surfaceless GL context on the render thread.
+    fn new() -> Result<Self>;
+
+    /// Make the context current on the calling (render) thread.
+    fn make_current(&self) -> Result<()>;
+
+    /// Hook run immediately before mpv renders into `buffer`'s FBO —
+    /// where a backend hands its exportable storage to GL. A no-op on
+    /// macOS/Linux (the storage is always GL's to write); on Windows it
+    /// takes the `WGL_NV_DX_interop2` lock.
+    fn begin_render(&self, buffer: &Self::Buffer);
+
+    /// Barrier guaranteeing every GPU write to `buffer` is complete — and
+    /// its exportable storage back in the owning API's hands — before the
+    /// frame is published to a consumer. `glFlush` (macOS), `glFinish`
+    /// (Linux), or `glFinish` plus the interop unlock (Windows).
+    fn publish_barrier(&self, buffer: &Self::Buffer);
+
+    /// Resolve a GL entry point for mpv's loader.
+    fn proc_address(name: &str) -> *mut c_void;
+}
+
+/// A "born exportable" color buffer: renderable as a GL FBO color
+/// attachment *and* exportable as a cross-API/cross-process handle. The
+/// platform-native export accessor (IOSurface / dmabuf fd / shared
+/// handle) is inherent to the concrete type — it differs in name and
+/// shape per platform, so it is deliberately **not** part of this common
+/// contract; only the lifecycle `mod.rs` drives is.
+pub(crate) trait ExportBuffer: Sized {
+    /// The context that allocates and tears these down.
+    type Backend: ExportBackend<Buffer = Self>;
+
+    /// Allocate a `width`×`height` exportable buffer. Render thread,
+    /// context current.
+    fn new(gl: &Self::Backend, width: u32, height: u32) -> Result<Self>;
+
+    /// The GL FBO name mpv renders into.
+    fn fbo(&self) -> u32;
+
+    /// `(width, height)` in pixels.
+    fn size(&self) -> (u32, u32);
+
+    /// Delete the GL-side names (render thread, context current). The
+    /// backing export memory is released by `Drop`; a buffer retired off
+    /// the render thread simply skips this and lets its names die with
+    /// the context.
+    fn delete_gl(&mut self, gl: &Self::Backend);
+
+    /// CPU readback as tightly packed BGRA8, row 0 at the top. Any
+    /// thread; must not touch GL.
+    fn copy_pixels(&self) -> Vec<u8>;
+}
+
 /// Attach-time configuration for
 /// [`Engine::attach_exported_render`](crate::Engine::attach_exported_render).
 ///
@@ -333,7 +413,7 @@ fn render_thread(
     // Advanced control on: this thread services `update()` promptly after
     // every callback by construction, and mpv gets direct rendering.
     let proc_address: Box<dyn FnMut(&str) -> *mut c_void + Send + 'static> =
-        Box::new(platform::gl_proc_address);
+        Box::new(platform::GlContext::proc_address);
     // SAFETY: the GL context above is current on this thread now and for
     // every later call — context and renderer live and die on this one
     // thread, with the renderer dropped first (declaration order below is
@@ -533,7 +613,7 @@ fn render_one(
         fbo: buffer.fbo() as i32,
         width: width as i32,
         height: height as i32,
-        internal_format: platform::FBO_INTERNAL_FORMAT,
+        internal_format: platform::GlContext::FBO_INTERNAL_FORMAT,
     };
     // Hand the buffer's storage to GL (a no-op except on Windows, where
     // the interop lock is what makes the GL side's write legal) and give

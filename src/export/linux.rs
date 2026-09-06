@@ -26,6 +26,7 @@
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
+use super::{ExportBackend, ExportBuffer};
 use crate::error::{Error, Result};
 
 // ---- GBM (libgbm) ----
@@ -149,11 +150,6 @@ use super::gl_consts::{
 };
 
 const GL_NO_ERROR: u32 = 0;
-
-/// The FBO color format reported to mpv (`OpenGlFbo::internal_format`).
-/// A hint only — the real storage layout is fixed by the DMA-BUF's DRM
-/// fourcc, which GL learns through the EGLImage.
-pub(crate) const FBO_INTERNAL_FORMAT: i32 = GL_RGBA8 as i32;
 
 /// DRM fourcc `'AR24'` (`DRM_FORMAT_ARGB8888`): little-endian B,G,R,A
 /// bytes — the layout Vulkan calls `B8G8R8A8_UNORM` and wgpu calls
@@ -318,38 +314,6 @@ pub(crate) struct GlContext {
 }
 
 impl GlContext {
-    /// Bring the backend up on the first *usable* render node — a node
-    /// that opens is not enough on hybrid-GPU boxes, where e.g.
-    /// `renderD128` may lack EGL-on-GBM/dma-buf support while
-    /// `renderD129` is fully capable, so every setup failure falls
-    /// through to the next node (the wlroots/Mesa device-selection
-    /// discipline) rather than failing the attach.
-    pub(crate) fn new() -> Result<Self> {
-        let mut last_error = None;
-        for minor in 128..192 {
-            let Some(drm) = open_node(minor) else {
-                continue;
-            };
-            match Self::on_node(drm) {
-                Ok(gl) => return Ok(gl),
-                Err(e) => {
-                    tracing::debug!("export: render node renderD{minor} unusable: {e}");
-                    last_error = Some(e);
-                }
-            }
-        }
-        Err(match last_error {
-            Some(Error::ExportSetup(msg)) => {
-                Error::ExportSetup(format!("no usable DRM render node (last tried: {msg})"))
-            }
-            Some(e) => e,
-            None => Error::ExportSetup(
-                "no DRM render node under /dev/dri (no GPU, or no permission — user not in the render/video group?)"
-                    .into(),
-            ),
-        })
-    }
-
     fn on_node(drm: OwnedFd) -> Result<Self> {
         let gbm = unsafe { gbm_create_device(drm.as_raw_fd()) };
         if gbm.is_null() {
@@ -420,8 +384,49 @@ impl GlContext {
             fns,
         })
     }
+}
 
-    pub(crate) fn make_current(&self) -> Result<()> {
+impl ExportBackend for GlContext {
+    type Buffer = SurfaceBuffer;
+
+    /// The FBO color format reported to mpv (`OpenGlFbo::internal_format`).
+    /// A hint only — the real storage layout is fixed by the DMA-BUF's DRM
+    /// fourcc, which GL learns through the EGLImage.
+    const FBO_INTERNAL_FORMAT: i32 = GL_RGBA8 as i32;
+
+    /// Bring the backend up on the first *usable* render node — a node
+    /// that opens is not enough on hybrid-GPU boxes, where e.g.
+    /// `renderD128` may lack EGL-on-GBM/dma-buf support while
+    /// `renderD129` is fully capable, so every setup failure falls
+    /// through to the next node (the wlroots/Mesa device-selection
+    /// discipline) rather than failing the attach.
+    fn new() -> Result<Self> {
+        let mut last_error = None;
+        for minor in 128..192 {
+            let Some(drm) = open_node(minor) else {
+                continue;
+            };
+            match Self::on_node(drm) {
+                Ok(gl) => return Ok(gl),
+                Err(e) => {
+                    tracing::debug!("export: render node renderD{minor} unusable: {e}");
+                    last_error = Some(e);
+                }
+            }
+        }
+        Err(match last_error {
+            Some(Error::ExportSetup(msg)) => {
+                Error::ExportSetup(format!("no usable DRM render node (last tried: {msg})"))
+            }
+            Some(e) => e,
+            None => Error::ExportSetup(
+                "no DRM render node under /dev/dri (no GPU, or no permission — user not in the render/video group?)"
+                    .into(),
+            ),
+        })
+    }
+
+    fn make_current(&self) -> Result<()> {
         // Surfaceless: no EGLSurface exists anywhere in this backend;
         // rendering targets are FBOs (EGL_KHR_surfaceless_context,
         // presence checked at init).
@@ -437,7 +442,7 @@ impl GlContext {
     /// texture is always the render thread's to write. (Windows, whose
     /// exportable storage lives behind a `WGL_NV_DX_interop2` lock, is
     /// why the cross-platform seam has this call at all.)
-    pub(crate) fn begin_render(&self, _buffer: &SurfaceBuffer) {}
+    fn begin_render(&self, _buffer: &SurfaceBuffer) {}
 
     /// Publish barrier before a DMA-BUF is consumed by another API.
     /// Unlike IOSurface's flush-coherency contract on macOS, a DMA-BUF
@@ -447,8 +452,12 @@ impl GlContext {
     /// completion is guaranteed the blunt way: `glFinish` on this
     /// dedicated thread, so a published frame's pixels are already on
     /// the bus when the shell sees it and no consumer-side wait exists.
-    pub(crate) fn publish_barrier(&self, _buffer: &SurfaceBuffer) {
+    fn publish_barrier(&self, _buffer: &SurfaceBuffer) {
         unsafe { (self.fns.Finish)() };
+    }
+
+    fn proc_address(name: &str) -> *mut c_void {
+        gl_proc_address(name)
     }
 }
 
@@ -517,10 +526,12 @@ fn create_bo(gbm: *mut GbmDevice, width: u32, height: u32) -> Result<(*mut GbmBo
     )))
 }
 
-impl SurfaceBuffer {
+impl ExportBuffer for SurfaceBuffer {
+    type Backend = GlContext;
+
     /// Create a `width`×`height` buffer. Render thread only, GL context
     /// current.
-    pub(crate) fn new(gl: &GlContext, width: u32, height: u32) -> Result<Self> {
+    fn new(gl: &GlContext, width: u32, height: u32) -> Result<Self> {
         let (bo, fourcc) = create_bo(gl.gbm.0, width, height)?;
         let raw_fd = unsafe { gbm_bo_get_fd(bo) };
         if raw_fd < 0 {
@@ -622,24 +633,12 @@ impl SurfaceBuffer {
         })
     }
 
-    pub(crate) fn fbo(&self) -> u32 {
+    fn fbo(&self) -> u32 {
         self.fbo
     }
 
-    pub(crate) fn size(&self) -> (u32, u32) {
+    fn size(&self) -> (u32, u32) {
         (self.width, self.height)
-    }
-
-    pub(crate) fn dma_buf_fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd()
-    }
-
-    pub(crate) fn stride(&self) -> u32 {
-        self.stride
-    }
-
-    pub(crate) fn fourcc(&self) -> u32 {
-        self.fourcc
     }
 
     /// Delete the GL texture/framebuffer names and the EGLImage. Render
@@ -647,7 +646,7 @@ impl SurfaceBuffer {
     /// `Drop` (any thread). Buffers retired anywhere else simply skip
     /// this — their GL names and image die with the render thread's
     /// context and display.
-    pub(crate) fn delete_gl(&mut self, gl: &GlContext) {
+    fn delete_gl(&mut self, gl: &GlContext) {
         let f = &gl.fns;
         unsafe {
             if self.fbo != 0 {
@@ -672,7 +671,7 @@ impl SurfaceBuffer {
     /// no GBM, no EGL, so it works even after the render context is
     /// gone. Returns zeroed pixels if the exporter refuses CPU mapping
     /// (mirroring the macOS lock-failure behavior).
-    pub(crate) fn copy_pixels(&self) -> Vec<u8> {
+    fn copy_pixels(&self) -> Vec<u8> {
         let (w, h) = (self.width as usize, self.height as usize);
         let stride = self.stride as usize;
         let len = stride * h;
@@ -704,6 +703,41 @@ impl SurfaceBuffer {
     }
 }
 
+/// mpv's GL loader for the hidden context (and the module's own
+/// `load_fn!`): EGL 1.5's `eglGetProcAddress` resolves client-API and EGL
+/// entry points alike (the README's Linux loader note), with a `dlsym`
+/// fallback for the rare libEGL that still won't return core GL symbols.
+/// [`ExportBackend::proc_address`](super::ExportBackend::proc_address)
+/// delegates here.
+fn gl_proc_address(name: &str) -> *mut c_void {
+    let Ok(cname) = CString::new(name) else {
+        return std::ptr::null_mut();
+    };
+    let ptr = unsafe { eglGetProcAddress(cname.as_ptr()) };
+    if !ptr.is_null() {
+        return ptr;
+    }
+    unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) }
+}
+
+/// Linux's platform-native export accessors: the DMA-BUF handle and its
+/// layout. Deliberately outside the [`ExportBuffer`](super::ExportBuffer)
+/// contract — each platform's export currency differs — and used only by
+/// the Linux wgpu import and the frame's public dmabuf accessors.
+impl SurfaceBuffer {
+    pub(crate) fn dma_buf_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
+    pub(crate) fn stride(&self) -> u32 {
+        self.stride
+    }
+
+    pub(crate) fn fourcc(&self) -> u32 {
+        self.fourcc
+    }
+}
+
 // No Drop needed beyond the derived one: `OwnedFd` closes the fd; GL
 // names and the EGLImage are handled per `delete_gl`'s contract.
 
@@ -719,19 +753,4 @@ fn dma_buf_sync(fd: &OwnedFd, flags: u64) {
     unsafe {
         libc::ioctl(fd.as_raw_fd(), DMA_BUF_IOCTL_SYNC, &raw const sync);
     }
-}
-
-/// mpv's GL loader for the hidden context: EGL 1.5's `eglGetProcAddress`
-/// resolves client-API and EGL entry points alike (the README's Linux
-/// loader note), with a `dlsym` fallback for the rare libEGL that still
-/// won't return core GL symbols.
-pub(crate) fn gl_proc_address(name: &str) -> *mut c_void {
-    let Ok(cname) = CString::new(name) else {
-        return std::ptr::null_mut();
-    };
-    let ptr = unsafe { eglGetProcAddress(cname.as_ptr()) };
-    if !ptr.is_null() {
-        return ptr;
-    }
-    unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) }
 }
