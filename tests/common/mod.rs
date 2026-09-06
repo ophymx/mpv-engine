@@ -79,14 +79,22 @@ pub fn engine_with_frame() -> Option<(Engine, ExportedFrame, mpsc::Receiver<()>)
         .load_when_ready(clip.to_str().expect("utf-8 temp path"))
         .expect("load");
     let deadline = Instant::now() + Duration::from_secs(15);
+    // Counted so a failure says *which* way the backend broke: no
+    // publishes at all (a wedged render thread) reads differently from
+    // publishes that are all blank (a broken render or publish barrier).
+    let (mut signals, mut blank) = (0u32, 0u32);
     loop {
-        assert!(
-            Instant::now() < deadline,
-            "no exported frame published within 15s"
-        );
+        if Instant::now() >= deadline {
+            panic!(
+                "no exported frame with content published within 15s \
+                 ({signals} publish signal(s), {blank} blank frame(s))"
+            );
+        }
         // Signals can race the acquire (newest-wins pool), so treat them
         // as hints and poll the slot.
-        let _ = rx.recv_timeout(Duration::from_millis(200));
+        if rx.recv_timeout(Duration::from_millis(200)).is_ok() {
+            signals += 1;
+        }
         if let Some(frame) = engine.acquire_frame().expect("acquire") {
             // Alpha is opaque even on the pre-load clear render — only
             // the color channels distinguish video content.
@@ -97,6 +105,7 @@ pub fn engine_with_frame() -> Option<(Engine, ExportedFrame, mpsc::Receiver<()>)
             if has_content {
                 return Some((engine, frame, rx));
             }
+            blank += 1;
         }
     }
 }

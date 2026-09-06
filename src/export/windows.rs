@@ -35,9 +35,11 @@
 //! render thread (the module's only GL caller), so GL's thread rules are
 //! upheld by construction rather than by types. The D3D11 device is
 //! free-threaded; its immediate context is not, so it lives behind a
-//! mutex and is touched by [`SurfaceBuffer::copy_pixels`], which any
-//! thread may call, and by the publish barrier's `CopyResource`, which
-//! runs on the render thread. The shared NT handle is a kernel object, valid
+//! mutex ([`D3d11::context`]) taken by [`SurfaceBuffer::copy_pixels`],
+//! which any thread may call, by the publish barrier's `CopyResource`,
+//! and by every `WGL_NV_DX_interop2` call — those drive the immediate
+//! context inside the ICD, so being on the render thread does not
+//! excuse them from the mutex. The shared NT handle is a kernel object, valid
 //! from any thread or process — which is exactly why it is the export
 //! currency (the IOSurface / dmabuf-fd analog).
 //!
@@ -85,6 +87,13 @@ const IID_IDXGI_FACTORY1: Guid = Guid {
     data2: 0xf26f,
     data3: 0x4dba,
     data4: [0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87],
+};
+/// `IID_ID3D11Multithread`.
+const IID_ID3D11_MULTITHREAD: Guid = Guid {
+    data1: 0x9b7e_4e00,
+    data2: 0x342c,
+    data3: 0x4106,
+    data4: [0xa1, 0x9f, 0x4f, 0x27, 0x04, 0xf6, 0x89, 0xf0],
 };
 /// `IID_IDXGIResource1`.
 const IID_IDXGI_RESOURCE1: Guid = Guid {
@@ -379,6 +388,15 @@ struct ID3D11DeviceContextVtbl {
 }
 
 #[repr(C)]
+struct ID3D11MultithreadVtbl {
+    _unknown: IUnknownVtbl,
+    /// 3, 4.
+    _enter_leave: [*const c_void; 2],
+    /// 5.
+    set_multithread_protected: unsafe extern "system" fn(*mut c_void, Bool32) -> Bool32,
+}
+
+#[repr(C)]
 struct IDXGIResource1Vtbl {
     _unknown: IUnknownVtbl,
     /// `IDXGIObject` (3..=6).
@@ -458,6 +476,15 @@ fn hresult_error(what: &str, hr: Hresult) -> Error {
 struct D3d11 {
     device: *mut c_void,
     /// D3D11 devices are free-threaded; immediate contexts are not.
+    /// This mutex is the module's one serialization point for the
+    /// immediate context, and it covers more than the calls that name it
+    /// directly: `WGL_NV_DX_interop2`'s open/register/lock/unlock/
+    /// unregister/close all drive the immediate context inside the ICD,
+    /// so they take it too. Leaving the interop calls out is not a
+    /// theoretical hazard — the render thread hangs inside
+    /// `wglDXLockObjectsNV` when the shell calls
+    /// [`SurfaceBuffer::copy_pixels`] at the same moment, which an
+    /// acquire-and-inspect consumer does on every frame.
     context: Mutex<*mut c_void>,
 }
 
@@ -499,6 +526,31 @@ impl D3d11 {
                 com_release(device);
             }
             return Err(hresult_error("D3D11CreateDevice", hr));
+        }
+        // Belt and braces with `context`'s mutex below. That mutex covers
+        // every immediate-context call *this module* makes, including the
+        // interop entry points; multithread protection additionally covers
+        // the ones the ICD makes behind our back — `wglDXLockObjectsNV`
+        // and friends drive the immediate context internally, and so does
+        // the D3D11-on-D3D12/DXGI plumbing under some drivers. Failing to
+        // acquire the interface is not fatal: our own mutex is what the
+        // correctness argument rests on.
+        unsafe {
+            let mut multithread: *mut c_void = std::ptr::null_mut();
+            let hr = (vtbl::<IUnknownVtbl>(context).query_interface)(
+                context,
+                &IID_ID3D11_MULTITHREAD,
+                &mut multithread,
+            );
+            if hr >= 0 && !multithread.is_null() {
+                (vtbl::<ID3D11MultithreadVtbl>(multithread).set_multithread_protected)(
+                    multithread,
+                    1,
+                );
+                com_release(multithread);
+            } else {
+                tracing::debug!("export: ID3D11Multithread unavailable (HRESULT {hr:#010x})");
+            }
         }
         Ok(Self {
             device,
@@ -798,7 +850,8 @@ impl GlContext {
         let dx_device = unsafe { (fns.DXOpenDevice)(d3d.device) };
         if dx_device.is_null() {
             return Err(Error::ExportSetup(
-                "wglDXOpenDeviceNV refused the D3D11 device (GL and D3D on different GPUs,                  or no WGL_NV_DX_interop2 support)"
+                "wglDXOpenDeviceNV refused the D3D11 device (GL and D3D on different \
+                 GPUs, or no WGL_NV_DX_interop2 support)"
                     .into(),
             ));
         }
@@ -861,8 +914,12 @@ impl Drop for GlContext {
         unsafe {
             // The interop device closes first: it is the only thing here
             // that needs both the GL context current and the D3D11
-            // device alive.
+            // device alive. Under the immediate-context mutex, like
+            // every other interop call: a frame the shell still holds
+            // can be running `copy_pixels` on another thread right now.
+            let ctx = self.d3d.context.lock();
             (self.fns.DXCloseDevice)(self.dx_device);
+            drop(ctx);
             if wglGetCurrentContext() == self.hglrc {
                 wglMakeCurrent(std::ptr::null_mut(), std::ptr::null_mut());
             }
@@ -952,6 +1009,10 @@ impl SurfaceBuffer {
         let f = &gl.fns;
         unsafe {
             glGenTextures(1, &mut buffer.gl_texture);
+            // Registration touches the immediate context too (see
+            // `lock_for_gl`); the guard is scoped so the `lock_for_gl`
+            // below — the mutex is not reentrant — takes it afresh.
+            let _ctx = gl.d3d.context.lock();
             buffer.dx_object = (f.DXRegisterObject)(
                 gl.dx_device,
                 interop_texture,
@@ -1005,6 +1066,12 @@ impl SurfaceBuffer {
             return;
         }
         let mut object = self.dx_object;
+        // Under the immediate-context mutex: the ICD implements the lock
+        // by driving the D3D11 immediate context, which `copy_pixels`
+        // may be using from the shell's thread at this very moment (it
+        // runs on every acquired frame). Racing the two hangs the render
+        // thread inside the driver — see `D3d11::context`.
+        let _ctx = self.d3d.context.lock();
         if unsafe { (gl.fns.DXLockObjects)(gl.dx_device, 1, &mut object) } == 0 {
             tracing::warn!("export: wglDXLockObjectsNV failed; this frame may be stale");
         }
@@ -1016,6 +1083,8 @@ impl SurfaceBuffer {
             return;
         }
         let mut object = self.dx_object;
+        // Same immediate-context serialization as `lock_for_gl`.
+        let _ctx = self.d3d.context.lock();
         if unsafe { (gl.fns.DXUnlockObjects)(gl.dx_device, 1, &mut object) } == 0 {
             tracing::warn!("export: wglDXUnlockObjectsNV failed; this frame may be torn");
         }
@@ -1066,7 +1135,9 @@ impl SurfaceBuffer {
                 self.fbo = 0;
             }
             if !self.dx_object.is_null() {
+                let ctx = self.d3d.context.lock();
                 (f.DXUnregisterObject)(gl.dx_device, self.dx_object);
+                drop(ctx);
                 self.dx_object = NULL_HANDLE;
             }
             if self.gl_texture != 0 {
