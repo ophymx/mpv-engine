@@ -98,4 +98,9 @@ pub use error::{Error, Result};
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 pub use export::{ExportOptions, ExportedFrame};
+#[cfg(all(
+    feature = "wgpu",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub use export::{REQUIRED_WGPU_FEATURES, WGPU_BACKEND};
 pub use render::{GlRenderOptions, ProcAddressFn, RenderKind};

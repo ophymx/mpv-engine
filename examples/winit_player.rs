@@ -44,18 +44,9 @@ mod player {
     fn gfx_for_window(window: Arc<Window>) -> Gfx {
         let mut descriptor =
             wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()));
-        #[cfg(target_os = "macos")]
-        {
-            descriptor.backends = wgpu::Backends::METAL;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            descriptor.backends = wgpu::Backends::VULKAN;
-        }
-        #[cfg(target_os = "windows")]
-        {
-            descriptor.backends = wgpu::Backends::DX12;
-        }
+        // The backend the frame import lands on, straight from the crate —
+        // no per-OS ladder here.
+        descriptor.backends = mpv_engine::WGPU_BACKEND;
         let instance = wgpu::Instance::new(descriptor);
         let surface = instance
             .create_surface(window.clone())
@@ -66,9 +57,9 @@ mod player {
         }))
         .expect("no wgpu adapter for the native backend");
         let device_descriptor = wgpu::DeviceDescriptor {
-            // The dmabuf import is behind an explicit wgpu opt-in.
-            #[cfg(target_os = "linux")]
-            required_features: wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF,
+            // Whatever this platform's frame import needs (dmabuf opt-in on
+            // Linux, nothing elsewhere) — again from the crate, not cfg'd here.
+            required_features: mpv_engine::REQUIRED_WGPU_FEATURES,
             ..Default::default()
         };
         let (device, queue) =

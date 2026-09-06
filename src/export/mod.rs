@@ -873,6 +873,32 @@ unsafe fn pack_bgra_rows(base: *const u8, src_stride: usize, w: usize, h: usize)
     out
 }
 
+/// The wgpu backend [`ExportedFrame::into_wgpu_texture`] imports into on
+/// this platform — Metal (macOS), Vulkan (Linux), or DX12 (Windows). The
+/// import rejects a device on any other backend, so select this on your
+/// [`wgpu::Instance`] (`InstanceDescriptor::backends`) to steer
+/// `request_adapter` onto the matching one.
+#[cfg(all(feature = "wgpu", target_os = "macos"))]
+pub const WGPU_BACKEND: wgpu::Backends = wgpu::Backends::METAL;
+/// See [`WGPU_BACKEND`].
+#[cfg(all(feature = "wgpu", target_os = "linux"))]
+pub const WGPU_BACKEND: wgpu::Backends = wgpu::Backends::VULKAN;
+/// See [`WGPU_BACKEND`].
+#[cfg(all(feature = "wgpu", target_os = "windows"))]
+pub const WGPU_BACKEND: wgpu::Backends = wgpu::Backends::DX12;
+
+/// The wgpu device features [`ExportedFrame::into_wgpu_texture`] requires
+/// on this platform: `VULKAN_EXTERNAL_MEMORY_DMA_BUF` on Linux (the
+/// dmabuf import opt-in), empty on macOS and Windows. Pass it in your
+/// [`wgpu::DeviceDescriptor`]'s `required_features` — combine with your
+/// own with `|`. Without it the import fails at runtime with
+/// [`Error::WgpuImport`].
+#[cfg(all(feature = "wgpu", target_os = "linux"))]
+pub const REQUIRED_WGPU_FEATURES: wgpu::Features = wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
+/// See [`REQUIRED_WGPU_FEATURES`].
+#[cfg(all(feature = "wgpu", any(target_os = "macos", target_os = "windows")))]
+pub const REQUIRED_WGPU_FEATURES: wgpu::Features = wgpu::Features::empty();
+
 /// The `wgpu::TextureDescriptor` every `into_wgpu_texture` hands to
 /// `create_texture_from_hal` — identical on all three backends
 /// (`Bgra8Unorm`, `TEXTURE_BINDING | COPY_SRC`, 2D, one mip/sample). The
