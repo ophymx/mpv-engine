@@ -72,29 +72,39 @@ Owned here today:
   (`RenderKind`), so shells routing between per-backend paths (GPU
   texture sampling vs. RGBA upload) don't track the attach outcome in
   state of their own.
-- An exported-frame backend on macOS and Linux (non-default `export`
-  feature): `attach_exported_render` spawns an engine-owned render
-  thread with a hidden GL context (CGL on macOS; surfaceless EGL over a
-  DRM render node on Linux — no display server involved), mpv renders
-  into exportable framebuffers there (IOSurface-backed / DMA-BUF-backed),
-  and the shell pulls zero-copy `ExportedFrame` handles
-  (`acquire_frame`) to import into Metal / Vulkan / wgpu — the
-  consumer-side answer
+- An exported-frame backend on macOS, Linux and Windows (non-default
+  `export` feature): `attach_exported_render` spawns an engine-owned
+  render thread with a hidden GL context (CGL on macOS; surfaceless EGL
+  over a DRM render node on Linux — no display server involved; WGL on an
+  invisible window on Windows), mpv renders into exportable framebuffers
+  there (IOSurface-backed / DMA-BUF-backed / shared-D3D11-texture-backed
+  via `WGL_NV_DX_interop2`), and the shell pulls `ExportedFrame` handles
+  (`acquire_frame`) to import into Metal /
+  Vulkan / D3D / wgpu — the consumer-side answer
   to libmpv's GL-or-software render API, with no GL and no pixel copies
-  in the shell. Fully safe API (the GL-currency contract never crosses
+  in the shell. Zero-copy end to end on macOS and Linux; on Windows the
+  engine pays one GPU-local `CopyResource` per frame, for the reason in
+  the next paragraph. Fully safe API (the GL-currency contract never crosses
   it), newest-wins frame pool, live resizing (`set_export_size`), and
   BGRA8 row-0-at-top output pinned by an orientation test on each
   platform (on Linux: single-plane `AR24`/`XR24`, linear modifier, so
-  Vulkan import needs no modifier negotiation). The `wgpu`
+  Vulkan import needs no modifier negotiation; on Windows: a
+  `DXGI_FORMAT_B8G8R8A8_UNORM` shared NT handle with deliberately no
+  keyed mutex, so any importer can open it — carried on a second texture,
+  because `wglDXRegisterObjectNV` refuses NT-handle-shared resources
+  while `OpenSharedHandle` accepts nothing else, so the publish barrier
+  copies between them). The `wgpu`
   feature (implies `export`) adds `ExportedFrame::into_wgpu_texture`:
   the frame wrapped as a `wgpu::Texture` on the shell's device — Metal
   on macOS (IOSurface wrap, pool buffer returned via the hal drop
-  callback) or Vulkan on Linux (wgpu-hal's own dmabuf import; the
-  device opts in with `Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF`, and
-  the pool buffer is retired outright since wgpu's imported memory
-  reference owns the frame from there) — with the frame's memory kept
+  callback), Vulkan on Linux (wgpu-hal's own dmabuf import; the
+  device opts in with `Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF`), or
+  DX12 on Windows (`ID3D12Device::OpenSharedHandle`); on the latter two
+  the pool buffer is retired outright, since wgpu's imported reference
+  owns the frame's memory from there and neither hal path offers the
+  drop-callback seam — with the frame's memory kept
   out of mpv's hands until wgpu's own GPU-completion tracking releases
-  the texture: no manual hold-until-completion discipline on either
+  the texture: no manual hold-until-completion discipline on any
   platform. Verified by tests that read the texture back through wgpu
   and compare byte-for-byte with the exported buffer.
 - An event wakeup seam (`set_wakeup_callback`) so shells get a push
@@ -137,19 +147,28 @@ test suite runs without a display.
 
 On Linux, EGL 1.5's `eglGetProcAddress` resolves everything mpv asks for.
 Avoid libepoxy on glvnd builds: it doesn't export core GL symbols as
-`dlsym`-able functions and mpv reports `MPV_ERROR_UNSUPPORTED`.
+`dlsym`-able functions and mpv reports `MPV_ERROR_UNSUPPORTED`. On
+Windows the loader must be *both* halves: `wglGetProcAddress` (with a
+current context, and treating the 1/2/3/-1 returns as failures) for
+extensions, falling back to `GetProcAddress` on `opengl32.dll` for the
+GL 1.1 core it exports — a one-half loader fails mpv on half its symbol
+requests. The `export` backend's own loader does this; a shell wiring
+`attach_gl_render` on Windows owes it the same.
 
 ## Roadmap (planned non-default features)
 
-The `export` and `wgpu` features have shipped on both platforms —
+The `export` and `wgpu` features have shipped on all three platforms —
 IOSurface → Metal on macOS; DMA-BUF (GBM + surfaceless EGL, linear
 layout, `glFinish` publish barrier) → Vulkan via wgpu-hal's dmabuf
-import on Linux — see above. The rows below remain.
+import on Linux; shared D3D11 texture (WGL + `WGL_NV_DX_interop2`,
+`glFinish` plus interop unlock as the publish barrier) → DX12 via
+`OpenSharedHandle` on Windows — see above. The rows below remain.
 
 | feature | contents | churn it contains |
 |---|---|---|
 | `egl` | side EGL context + FBO render + RGBA readback (GL-accelerated; the pure-software path is already in core as `render_sw`) | none — stable APIs |
 | `export` (Linux, sync tier) | explicit sync-fd export (`EGL_ANDROID_native_fence_sync`) so the `glFinish` publish barrier can relax into a consumer-side semaphore wait; optional DRM-modifier negotiation as an `ExportOptions` knob | the *permanent* workarounds — e.g. wgpu-hal never enables `VK_KHR_external_semaphore_fd`, so the strict-loader `vkGetSemaphoreFdKHR` path lives here indefinitely |
+| `export` (Windows, sync tier) | a shared D3D11 fence (`ID3D11Device5::CreateFence` + `CreateSharedHandle`) so the `glFinish` publish barrier can relax into a consumer-side wait, and adapter pinning so the shell can force the hidden context onto its own GPU | keyed mutexes are the obvious alternative and are *not* usable — wgpu-hal's DX12 importer never acquires one — so the fence path lives here indefinitely |
 
 The default feature set never grows unstable dependencies: a consumer on
 core + `egl` alone is structurally isolated from all of it.
@@ -165,14 +184,18 @@ are generated with ffmpeg. Both are probed at runtime — missing tooling
 skips tests rather than failing them. System deps: the libmpv dev
 package to build, ffmpeg to generate test inputs; on Linux the `export`
 feature additionally links libEGL and libgbm (their dev packages at
-build time). With `--features export`, the exported-backend tests
+build time), and on Windows opengl32, d3d11, dxgi, user32 and gdi32
+(all in the Windows SDK the MSVC toolchain already needs). With
+`--features export`, the exported-backend tests
 render through a real hidden GL context (CGL on macOS, EGL on a DRM
-render node on Linux) and read pixels back through the exported buffer
-(IOSurface / dmabuf mmap) — a session without GPU access (no
-WindowServer, no readable `/dev/dri/renderD*`) skips them the same way.
+render node on Linux, WGL on Windows) and read pixels back through the
+exported buffer (IOSurface lock / dmabuf mmap / D3D11 staging copy) — a
+session without GPU access (no WindowServer, no readable
+`/dev/dri/renderD*`, no OpenGL ICD or no `WGL_NV_DX_interop2`) skips
+them the same way.
 `--features wgpu` additionally round-trips frames through a real wgpu
-device (Metal / Vulkan with `VULKAN_EXTERNAL_MEMORY_DMA_BUF`), skipping
-when no capable adapter exists.
+device (Metal / Vulkan with `VULKAN_EXTERNAL_MEMORY_DMA_BUF` / DX12 on
+the engine's own adapter), skipping when no capable adapter exists.
 
 There's also a runnable end-to-end demo of the exported-frame → wgpu
 path — a minimal winit player with no GL and no shaders in the app
