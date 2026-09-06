@@ -714,6 +714,7 @@ dependencies = [
 name = "mpv-engine"
 version = "0.2.0"
 dependencies = [
+ "ash",
  "libc",
  "objc2 0.6.4",
  "objc2-io-surface",

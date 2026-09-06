@@ -1,26 +1,31 @@
 //! Zero-copy wgpu import for [`ExportedFrame`] (`wgpu` feature, Linux):
-//! DMA-BUF → `VkImage` on the consumer's device → `wgpu::Texture`,
-//! through wgpu-hal's own dmabuf import (`texture_from_dmabuf_fd`,
-//! DRM-modifier tiling with our linear layout) — no pixel copies
-//! anywhere, and no hand-rolled ash in this crate.
+//! DMA-BUF → `VkImage` on the consumer's device → `wgpu::Texture` — no
+//! pixel copies anywhere.
 //!
-//! The lifetime story deliberately differs from the Metal path.
-//! wgpu-hal's dmabuf import owns the imported image and memory outright
-//! (there is no drop-callback seam on that path), and the imported
-//! memory holds its own kernel reference on the dmabuf — so instead of
-//! returning the pool buffer when wgpu finishes, the import *retires*
-//! it ([`super::retire_buffer`]): the buffer leaves the pool for good,
-//! mpv never renders into that memory again (killing the aliasing
-//! hazard the same way the Metal drop callback does), the render thread
-//! allocates a replacement, and wgpu frees image + memory on its own
-//! completion schedule. The consumer-facing contract is identical on
-//! both platforms: drop the texture whenever you're done encoding.
+//! **POC (github.com/ophymx/mpv-engine/issues/4):** this hand-rolls the
+//! dmabuf → `VkImage` import with `ash` and wraps it via wgpu-hal's
+//! *public* `texture_from_raw`, rather than the convenience
+//! `texture_from_dmabuf_fd`. The reason is the lifetime story: the
+//! convenience path hardcodes `drop_callback: None`, taking ownership of
+//! the image with no completion hook — which forced Linux to *retire* the
+//! pool buffer on every imported frame and reallocate a fresh GBM bo +
+//! EGLImage (~33 MB at 4K, per displayed frame). `texture_from_raw`
+//! accepts a `DropCallback`; wgpu fires it only once every submission
+//! using the texture has retired — exactly when the pool may recycle — so
+//! the buffer is **returned** and reused, the same as the Metal path and
+//! the Windows `ReleaseKeeper` path. `TextureMemory::External` keeps the
+//! image and imported memory ours to destroy in the callback.
 //!
-//! No semaphore machinery: the backend's publish barrier is a
-//! `glFinish` (see the platform module), so a frame's pixels are
-//! complete before the shell can ever see the frame. The roadmap's
-//! sync-fd tier is what would put `add_wait_semaphore` back on the
-//! table here.
+//! The consumer-facing contract is unchanged and identical across
+//! platforms: drop the texture whenever you're done encoding with it.
+//!
+//! No semaphore machinery: the backend's publish barrier is a `glFinish`
+//! (see the platform module), so a frame's pixels are complete before the
+//! shell can ever see the frame. The roadmap's sync-fd tier is what would
+//! put `add_wait_semaphore` back on the table here.
+
+use std::os::fd::IntoRawFd;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
@@ -91,49 +96,179 @@ impl ExportedFrame {
             memory_flags: wgpu_hal::MemoryFlags::empty(),
             view_formats: vec![],
         };
+        // POC (github.com/ophymx/mpv-engine/issues/4): wgpu-hal's
+        // `texture_from_dmabuf_fd` hardcodes `drop_callback: None`, so it
+        // owns the imported image with no completion hook — which forced the
+        // retire-and-reallocate model on Linux (a fresh GBM bo + EGLImage per
+        // displayed frame). Build the same VkImage + imported memory directly
+        // and wrap it with the *public* `texture_from_raw`, passing a
+        // `DropCallback`. wgpu destroys the texture — and fires the callback —
+        // only once every submission using it has retired, exactly when the
+        // pool may recycle, so the buffer is **returned**, not retired, the
+        // same as the macOS/Metal drop-callback path.
+        use ash::vk;
+
         let hal_texture = {
-            // The guard is read-only access to the hal device and is
-            // dropped before `create_texture_from_hal` (a wgpu-core call
-            // on the same device) below.
+            // Read-only guard on the hal device; dropped before the
+            // `create_texture_from_hal` wgpu-core call below. The cloned
+            // `ash::Device` moved into the callback keeps working afterwards.
             let hal_device = unsafe { device.as_hal::<wgpu_hal::api::Vulkan>() };
             let Some(hal_device) = hal_device else {
                 return Err(Error::WgpuImport(
                     "wgpu device is not on the Vulkan backend".into(),
                 ));
             };
-            // SAFETY: `fd` is a valid dmabuf matching `hal_desc`, with
-            // the linear modifier, `stride` and offset 0 straight from
-            // the buffer's GBM allocation. Ownership of `fd` transfers
-            // (it is our duplicate).
+            let raw_device = hal_device.raw_device().clone();
+            let phys = hal_device.raw_physical_device();
+            let instance = hal_device.shared_instance().raw_instance();
+            let ext_fd = ash::khr::external_memory_fd::Device::new(instance, &raw_device);
+
+            // Create the VkImage (external memory + explicit DRM modifier),
+            // mirroring wgpu-hal's own single-plane image create-info.
+            let mut ext_img = vk::ExternalMemoryImageCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let plane = vk::SubresourceLayout {
+                offset: 0,
+                row_pitch: stride,
+                size: 0,
+                array_pitch: 0,
+                depth_pitch: 0,
+            };
+            let mut drm = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+                .drm_format_modifier(platform::MODIFIER_LINEAR)
+                .plane_layouts(core::slice::from_ref(&plane));
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .push_next(&mut ext_img)
+                .push_next(&mut drm);
+            // SAFETY: valid create-info; `image` is destroyed on every error
+            // path below and by the drop callback on success.
+            let image = unsafe { raw_device.create_image(&image_info, None) }
+                .map_err(|e| Error::WgpuImport(format!("vkCreateImage (dmabuf): {e}")))?;
+            let reqs = unsafe { raw_device.get_image_memory_requirements(image) };
+
+            // A successful vkAllocateMemory consumes the fd; until then it is
+            // ours to close on any early return (wgpu-hal's own dance).
+            let fd_raw = fd.into_raw_fd();
+
+            let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+            if let Err(e) = unsafe {
+                ext_fd.get_memory_fd_properties(
+                    vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                    fd_raw,
+                    &mut fd_props,
+                )
+            } {
+                unsafe {
+                    libc::close(fd_raw);
+                    raw_device.destroy_image(image, None);
+                }
+                return Err(Error::WgpuImport(format!(
+                    "vkGetMemoryFdPropertiesKHR: {e}"
+                )));
+            }
+
+            let mem_props = unsafe { instance.get_physical_device_memory_properties(phys) };
+            let type_bits = reqs.memory_type_bits & fd_props.memory_type_bits;
+            let Some(mem_type) =
+                (0..mem_props.memory_type_count).find(|i| type_bits & (1 << i) != 0)
+            else {
+                unsafe {
+                    libc::close(fd_raw);
+                    raw_device.destroy_image(image, None);
+                }
+                return Err(Error::WgpuImport(
+                    "no Vulkan memory type accepts this dmabuf".into(),
+                ));
+            };
+
+            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+            let mut import = vk::ImportMemoryFdInfoKHR::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+                .fd(fd_raw);
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(reqs.size)
+                .memory_type_index(mem_type)
+                .push_next(&mut import)
+                .push_next(&mut dedicated);
+            // SAFETY: dedicated allocation for `image`, importing `fd_raw`.
+            // Vulkan owns the fd on success; on failure it does not, so close.
+            let memory = match unsafe { raw_device.allocate_memory(&alloc_info, None) } {
+                Ok(memory) => memory,
+                Err(e) => {
+                    unsafe {
+                        libc::close(fd_raw);
+                        raw_device.destroy_image(image, None);
+                    }
+                    return Err(Error::WgpuImport(format!(
+                        "vkAllocateMemory (import dmabuf): {e}"
+                    )));
+                }
+            };
+            // fd is now owned by Vulkan.
+            if let Err(e) = unsafe { raw_device.bind_image_memory(image, memory, 0) } {
+                unsafe {
+                    raw_device.free_memory(memory, None);
+                    raw_device.destroy_image(image, None);
+                }
+                return Err(Error::WgpuImport(format!(
+                    "vkBindImageMemory (dmabuf): {e}"
+                )));
+            }
+
+            // Fully imported: move the pool buffer into the drop callback.
+            // With `TextureMemory::External` + `Some(cb)`, wgpu-hal frees
+            // neither the image nor the memory — the callback is the sole
+            // owner of teardown, and it fires when wgpu is done with the
+            // texture, the safe moment to recycle the buffer.
+            let buffer = self
+                .buffer
+                .take()
+                .expect("buffer present until drop/presented");
+            let shared = Arc::clone(&self.shared);
+            let cb_device = raw_device.clone();
+            let drop_cb: wgpu_hal::DropCallback = Box::new(move || {
+                // SAFETY: fires after wgpu destroyed the texture, i.e. after
+                // every GPU submission using it retired; `image`/`memory` are
+                // ours (External) and no longer referenced.
+                unsafe {
+                    cb_device.destroy_image(image, None);
+                    cb_device.free_memory(memory, None);
+                }
+                super::return_buffer(&shared, buffer);
+            });
+
+            // SAFETY: `image` matches `hal_desc`, is backed by `memory`, and
+            // both stay valid until the callback runs (External).
             unsafe {
-                hal_device.texture_from_dmabuf_fd(
-                    fd,
+                hal_device.texture_from_raw(
+                    image,
                     &hal_desc,
-                    platform::MODIFIER_LINEAR,
-                    stride,
-                    0,
+                    Some(drop_cb),
+                    wgpu_hal::vulkan::TextureMemory::External,
                 )
             }
-            .map_err(|e| Error::WgpuImport(format!("dmabuf import failed: {e}")))?
         };
 
-        // The import succeeded: wgpu owns the image and the imported
-        // memory (its own kernel reference on the dmabuf), so the pool
-        // buffer is retired — mpv must never render into that memory
-        // again. Our own Drop sees `None` and stands down.
-        let buffer = self
-            .buffer
-            .take()
-            .expect("buffer present until drop/presented");
-        super::retire_buffer(&self.shared, buffer);
-
         let desc = super::exported_texture_desc(width, height);
-        // SAFETY: hal texture and descriptor agree, and the content is
-        // fully initialized (RESOURCE = shader-readable) — mpv rendered
-        // and glFinish'd before publish. (The image's *layout* was never
-        // touched by Vulkan; for a linear DRM-modifier image the
-        // declared-vs-actual mismatch on the first transition is
-        // content-preserving, which the byte-for-byte import test pins.)
+        // SAFETY: hal texture and descriptor agree, and the content is fully
+        // initialized (RESOURCE = shader-readable) — mpv rendered and
+        // glFinish'd before publish. For a linear DRM-modifier image the
+        // declared-vs-actual layout mismatch on the first transition is
+        // content-preserving, which the byte-for-byte import test pins.
         Ok(unsafe {
             device.create_texture_from_hal::<wgpu_hal::api::Vulkan>(
                 hal_texture,
