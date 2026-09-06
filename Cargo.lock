@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "mpv-engine"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "libc",
  "objc2 0.6.4",
