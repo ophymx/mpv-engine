@@ -1,6 +1,6 @@
 [package]
 name = "mpv-engine"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Toolkit-agnostic libmpv embedding core: handle lifecycle, commands, typed events, and render seams."
@@ -16,6 +16,34 @@ categories = ["multimedia::video"]
 # (`egl`, `export`, `wgpu`) get their own entries when implemented — see
 # README "Roadmap".
 
+[features]
+# Exported-frame render backend (macOS + Linux + Windows): the engine
+# owns a hidden GL context on a dedicated render thread (CGL /
+# surfaceless EGL over a DRM render node / WGL on an invisible window),
+# renders into exportable framebuffers (IOSurface / DMA-BUF / shared
+# D3D11 texture), and hands the shell zero-copy frame handles for Metal /
+# Vulkan / D3D / wgpu import. Links the OpenGL, IOSurface and
+# CoreFoundation frameworks (macOS), libEGL and libgbm (Linux), or
+# opengl32, d3d11, dxgi, user32 and gdi32 (Windows) directly — no new
+# Rust dependencies, per the policy above. On other platforms the feature
+# compiles to nothing.
+export = []
+# Zero-copy import of ExportedFrame into wgpu (implies `export`; macOS →
+# Metal, Linux → Vulkan via wgpu-hal's own dmabuf import, Windows → DX12
+# via OpenSharedHandle).
+# Non-default and wgpu-major-locked on purpose — releases carrying it
+# track wgpu majors (the egui-wgpu pattern, see README), so core-only
+# consumers never feel that churn. Needs Rust 1.87 (wgpu's MSRV).
+wgpu = [
+    "export",
+    "dep:wgpu",
+    "dep:wgpu-hal",
+    "dep:objc2",
+    "dep:objc2-metal",
+    "dep:objc2-io-surface",
+    "dep:windows",
+]
+
 [dependencies]
 libc = "0.2"
 # rsmpv/rsmpv-sys are permissively licensed (MIT OR Apache-2.0 / ISC)
@@ -27,5 +55,51 @@ parking_lot = "0.12"
 thiserror = "2"
 tracing = "0.1"
 
+# wgpu with only the platform's native backend enabled: Vulkan on Linux,
+# whose wgpu-hal carries the dmabuf import the Linux `wgpu` feature
+# rides on (the Metal twin lives in the macOS section below).
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["vulkan"], optional = true }
+wgpu-hal = { version = "30", default-features = false, features = ["vulkan"], optional = true }
+
+# The objc2 trio exists only to wrap an IOSurface in an MTLTexture on the
+# consumer's device — the same generation of bindings wgpu-hal's Metal
+# backend itself uses, so no second ObjC binding family enters the tree.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["metal"], optional = true }
+wgpu-hal = { version = "30", default-features = false, features = ["metal"], optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3.2", optional = true, features = [
+    "MTLAllocation",
+    "MTLDevice",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLTexture",
+    "objc2-io-surface",
+] }
+objc2-io-surface = { version = "0.3.2", optional = true, features = [
+    "objc2-core-foundation",
+] }
+
+# wgpu's DX12 backend plus the one `windows` interface the import needs
+# (`ID3D12Device::OpenSharedHandle`) — the same generation of bindings
+# wgpu-hal's own DX12 backend speaks, so no second Win32 binding family
+# enters the tree. This is the objc2-trio arrangement, transposed.
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["dx12"], optional = true }
+wgpu-hal = { version = "30", default-features = false, features = ["dx12"], optional = true }
+windows = { version = "0.62", default-features = false, optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D12",
+] }
+
 [dev-dependencies]
 tempfile = "3"
+pollster = "0.4"
+# Example-only (winit_player); dev-deps never reach consumers, so the
+# no-toolkit-deps policy above is untouched.
+winit = "0.30"
+
+[[example]]
+name = "winit_player"
+required-features = ["wgpu"]

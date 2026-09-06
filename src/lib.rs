@@ -24,7 +24,7 @@
 //! the sealed [`PropertyGet`]), so the underlying binding's traits never
 //! enter this crate's public API.
 //!
-//! Two render backends share one attach slot: OpenGL
+//! The render backends share one attach slot: OpenGL
 //! ([`Engine::attach_gl_render`] / [`Engine::render_gl`]) and software
 //! ([`Engine::attach_sw_render`] / [`Engine::render_sw`], RGBA into a
 //! caller buffer, no GL anywhere). [`Engine::attached_render`] reports
@@ -36,7 +36,21 @@
 //! to fix the shell's render-loop discipline: whether `render_gl` blocks
 //! until the frame's target time (right for a toolkit paint handler,
 //! wrong on a compositor thread), and mpv's advanced control (which
-//! obligates [`Engine::render_update`] after every update callback). Event delivery is pull-based
+//! obligates [`Engine::render_update`] after every update callback).
+//! On macOS, Linux and Windows the non-default `export` feature adds a
+//! third, fully safe backend (`Engine::attach_exported_render`): the
+//! engine renders on a hidden GL context of its own and hands the shell
+//! zero-copy exportable frames (`ExportedFrame` — IOSurface-backed on
+//! macOS, DMA-BUF-backed on Linux, shared-D3D11-texture-backed on
+//! Windows) for Metal / Vulkan / D3D / wgpu import — no GL and no pixel
+//! copies in the shell. The `wgpu` feature (implies
+//! `export`, wgpu-major-locked) adds
+//! `ExportedFrame::into_wgpu_texture`,
+//! which wraps the frame as a `wgpu::Texture` on the shell's device
+//! (Metal on macOS, Vulkan on Linux, DX12 on Windows) and leaves the
+//! frame's memory in wgpu's own GPU-completion tracking — no manual
+//! hold-until-done.
+//! Event delivery is pull-based
 //! ([`Engine::pump_events`]) with an optional push signal
 //! ([`Engine::set_wakeup_callback`]) for shells that don't want a
 //! polling timer.
@@ -67,6 +81,11 @@
 
 mod engine;
 mod error;
+#[cfg(all(
+    feature = "export",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod export;
 mod render;
 
 pub use engine::{
@@ -74,4 +93,14 @@ pub use engine::{
     PropertyValue,
 };
 pub use error::{Error, Result};
+#[cfg(all(
+    feature = "export",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub use export::{ExportOptions, ExportedFrame};
+#[cfg(all(
+    feature = "wgpu",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub use export::{REQUIRED_WGPU_FEATURES, WGPU_BACKEND};
 pub use render::{GlRenderOptions, ProcAddressFn, RenderKind};

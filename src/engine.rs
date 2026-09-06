@@ -5,6 +5,11 @@ use parking_lot::Mutex;
 use rsmpv::{EndFileReason, Event, Format, Mpv, PropertyData, sys};
 
 use crate::error::{Error, Result, describe_code};
+#[cfg(all(
+    feature = "export",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+use crate::export::{ExportOptions, ExportedFrame, ExportedRender};
 use crate::render::{
     GlRender, GlRenderOptions, ProcAddressFn, RenderBackend, RenderKind, SwRender,
 };
@@ -249,6 +254,11 @@ impl EngineBuilder {
         Ok(Engine {
             render: Mutex::new(None),
             attach: Mutex::new(()),
+            #[cfg(all(
+                feature = "export",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            orphaned_render: Mutex::new(None),
             pump: Mutex::new(()),
             next_observe_id: AtomicU64::new(1),
             pending_load: Mutex::new(None),
@@ -278,6 +288,18 @@ pub struct Engine {
     /// the `render` lock — the synchronous `on_update` during create
     /// must stay free to touch render methods.
     attach: Mutex<()>,
+    /// `JoinHandle` of an export render thread whose detach ran *on*
+    /// that thread (a shell calling
+    /// [`detach_render`](Engine::detach_render) from `on_update`): the
+    /// self path can't join, so the handle parks here and the next
+    /// attach / detach / engine drop on another thread joins the
+    /// deferred teardown — instead of leaving the thread's GL/mpv
+    /// teardown to race process exit forever.
+    #[cfg(all(
+        feature = "export",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    orphaned_render: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Keeps each [`pump_events`](Engine::pump_events) drain atomic.
     /// rsmpv's `poll_event` is safe to call concurrently, but concurrent
     /// pollers *split* the stream (each event goes to exactly one
@@ -759,6 +781,14 @@ impl Engine {
         on_update: impl Fn() + Send + Sync + 'static,
     ) -> Result<()> {
         let _attaching = self.attach.lock();
+        // Join any teardown deferred by a detach-from-`on_update` before
+        // creating a context: the orphaned thread frees the old mpv
+        // render context on exit, and libmpv allows only one per core.
+        #[cfg(all(
+            feature = "export",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        ))]
+        self.join_orphaned_render();
         if self.render.lock().is_some() {
             return Err(Error::AlreadyAttached);
         }
@@ -814,6 +844,11 @@ impl Engine {
     pub fn attach_sw_render(&self, on_update: impl Fn() + Send + Sync + 'static) -> Result<()> {
         // Same locking shape as `attach_gl_render`, for the same reasons.
         let _attaching = self.attach.lock();
+        #[cfg(all(
+            feature = "export",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        ))]
+        self.join_orphaned_render();
         if self.render.lock().is_some() {
             return Err(Error::AlreadyAttached);
         }
@@ -881,12 +916,137 @@ impl Engine {
     /// defer-or-load decision reads the live `vo`, so loads then run
     /// immediately instead of parking.
     pub fn detach_render(&self) {
-        if self.render.lock().take().is_some() {
-            // Release the shell's callback with the context: nothing can
-            // fire it anymore, and keeping it would pin its captures
-            // (typically shell window state) until the next attach.
-            self.set_update_slot(Arc::new(|| {}));
+        // Locking here answers three hazards at once:
+        //
+        // * The take + callback-slot reset happen inside one render-lock
+        //   scope, so a racing attach — which re-checks the slot under
+        //   the render lock before registering its `on_update` — orders
+        //   its registration strictly after our reset. (Resetting after
+        //   the take, unordered, could clobber a concurrently-completed
+        //   attach's fresh callback: a silent permanent freeze.)
+        // * Off the render thread (the normal case), the attach lock is
+        //   held across take/reset/drop, so an attach can't call
+        //   `mpv_render_context_create` while the old context is still
+        //   being freed — libmpv allows one render context per core, and
+        //   that race read as a spurious attach failure.
+        // * The backend itself still drops with the render lock
+        //   released: the exported backend's drop joins its render
+        //   thread, and an in-flight frame-published callback calling
+        //   `acquire_frame` (render lock) would deadlock against a join
+        //   performed under it.
+        //
+        // The exception is a detach from the exported backend's *own*
+        // render thread (a shell tearing down from `on_update`): taking
+        // the attach lock there can deadlock against a concurrent detach
+        // that holds it while joining this very thread — so the self
+        // path skips the attach lock (its take/reset ordering still
+        // holds via the render lock), and `ExportedRender`'s drop skips
+        // the self-join, deferring thread exit to just after the
+        // callback returns — with the thread's handle parked in
+        // `orphaned_render` so a later attach/detach/engine-drop joins
+        // the deferred teardown instead of racing it.
+        let on_render_thread = {
+            let slot = self.render.lock();
+            match slot.as_ref() {
+                // Nothing attached: done. Returning without touching the
+                // attach lock also lets a callback-detach racing a
+                // concurrent detach (which already took the backend and
+                // now joins this thread under the attach lock) unwind
+                // instead of deadlocking.
+                None => return,
+                Some(backend) => backend.on_own_render_thread(),
+            }
+        };
+        let _attaching = if on_render_thread {
+            None
+        } else {
+            let attaching = self.attach.lock();
+            // A prior detach-from-callback may have parked its render
+            // thread; join that deferred teardown first (under the
+            // attach lock, so it is fully over before this detach's own
+            // backend drop and any subsequent attach).
+            #[cfg(all(
+                feature = "export",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            self.join_orphaned_render();
+            Some(attaching)
+        };
+        let (taken, displaced) = {
+            let mut slot = self.render.lock();
+            #[cfg_attr(
+                not(all(
+                    feature = "export",
+                    any(target_os = "macos", target_os = "linux", target_os = "windows")
+                )),
+                allow(unused_mut)
+            )]
+            let mut taken = slot.take();
+            // Self path: the backend's drop below can't join its own
+            // thread, so park the handle for the next engine call from
+            // another thread to join. Parked *inside* this render-lock
+            // scope, so once the slot reads empty the handle is already
+            // there — an attach that saw the slot clear joins it rather
+            // than racing the deferred teardown. (A still-parked older
+            // orphan, if any, has long exited and drops detached —
+            // exactly its pre-parking fate.)
+            #[cfg(all(
+                feature = "export",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            if on_render_thread {
+                if let Some(RenderBackend::Exported(render)) = taken.as_mut() {
+                    *self.orphaned_render.lock() = render.take_thread();
+                }
+            }
+            // Swap the shell's callback out with the context: nothing
+            // can fire it anymore, and keeping it would pin its captures
+            // (typically shell window state) until the next attach. Only
+            // the *swap* happens under the render lock (ordering, per
+            // above); the displaced closure drops at the end of this fn,
+            // outside every engine lock — its captures' `Drop` may call
+            // back into the engine.
+            let displaced = taken.as_ref().map(|_| {
+                std::mem::replace(
+                    &mut *self.render_update_cb.lock(),
+                    Arc::new(|| {}) as UpdateCallback,
+                )
+            });
+            (taken, displaced)
+        };
+        if taken.is_some() {
+            // The backend drops while the attach lock (when held) is
+            // still ours: this joins the export render thread and frees
+            // the mpv render context, which must finish before a
+            // concurrent attach may create a new context.
+            drop(taken);
             tracing::debug!("mpv render context detached");
+        }
+        drop(_attaching);
+        // Only now, with no engine lock held, release the shell's
+        // callback: its captures' `Drop` may call back into the engine —
+        // attach methods included, which take the attach lock.
+        drop(displaced);
+    }
+
+    /// Join a render thread parked by a detach-from-`on_update` (see
+    /// `orphaned_render`). No-op when nothing is parked; when called
+    /// *on* the orphaned thread itself (another engine call from that
+    /// same callback), the handle stays parked for a real joiner —
+    /// self-joining would deadlock.
+    #[cfg(all(
+        feature = "export",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    fn join_orphaned_render(&self) {
+        let mut parked = self.orphaned_render.lock();
+        if let Some(handle) = parked.take() {
+            if handle.thread().id() == std::thread::current().id() {
+                *parked = Some(handle);
+            } else {
+                drop(parked);
+                let _ = handle.join();
+            }
         }
     }
 
@@ -1020,12 +1180,168 @@ impl Engine {
             None => Ok(()),
         }
     }
+
+    /// Create the exported-frame render backend (`export` feature): the
+    /// engine spawns a render thread owning a hidden GL context, mpv
+    /// renders there into exportable framebuffers (IOSurface-backed on
+    /// macOS, DMA-BUF-backed on Linux, shared-D3D11-texture-backed on
+    /// Windows), and the shell pulls zero-copy [`ExportedFrame`]s with
+    /// [`acquire_frame`](Self::acquire_frame) to import into Metal /
+    /// Vulkan / D3D / wgpu.
+    /// Fully safe — no GL context or currency contract crosses this API;
+    /// the thread that creates the context is the thread that renders on
+    /// it and frees it.
+    ///
+    /// `on_update` differs from the other backends' callback: it fires
+    /// **after a frame is published**, from the engine's own render
+    /// thread (plus the usual synchronous fire when
+    /// [`set_render_update_callback`](Self::set_render_update_callback)
+    /// replaces it, and once from inside a successful attach when a
+    /// frame was already published while the attach was completing — so
+    /// a poke is never lost to that window). Calling
+    /// [`acquire_frame`](Self::acquire_frame)
+    /// inside it is fine; just don't block in it — it stalls video
+    /// pacing. Frames published before the shell drains them are
+    /// replaced, newest wins.
+    ///
+    /// Tearing down from inside `on_update` —
+    /// [`detach_render`](Self::detach_render), or dropping the last
+    /// engine handle — is supported: the render thread's teardown is
+    /// deferred to just after the callback returns instead of joined
+    /// (which would self-deadlock). A `detach_render` parks the deferred
+    /// thread's handle, and the next attach/detach/engine-drop from
+    /// another thread joins it — so a re-attach orders strictly after
+    /// the old teardown rather than racing it. One limit applies:
+    /// **attach calls must not be made from inside `on_update`** (nor
+    /// from callback captures' `Drop`) — a concurrent detach may hold
+    /// the attach serialization lock while waiting on this very thread.
+    ///
+    /// Shares the single render slot with the other backends
+    /// ([`Error::AlreadyAttached`]); [`detach_render`](Self::detach_render)
+    /// shuts the render thread down (no GL-currency obligation for the
+    /// caller — unique among the GL-based backends), and a successful
+    /// attach issues any [`load_when_ready`](Self::load_when_ready)
+    /// queue, with the same failure routing as the other attach methods.
+    ///
+    /// Errors with [`Error::ExportSetup`] when no GL context can be
+    /// created — typically a session without GPU access (no
+    /// WindowServer on macOS, no readable DRM render node on Linux, no
+    /// OpenGL ICD or no `WGL_NV_DX_interop2` on Windows); treat it like
+    /// a missing display.
+    #[cfg(all(
+        feature = "export",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub fn attach_exported_render(
+        &self,
+        options: ExportOptions,
+        on_update: impl Fn() + Send + Sync + 'static,
+    ) -> Result<()> {
+        // Same locking shape as `attach_gl_render`, for the same reasons.
+        let attaching = self.attach.lock();
+        // A detach-from-`on_update` defers its render thread's teardown;
+        // join it here so this attach orders strictly after it (and so
+        // its `Error::ExportSetup` window can't be hit by this path).
+        self.join_orphaned_render();
+        if self.render.lock().is_some() {
+            return Err(Error::AlreadyAttached);
+        }
+        self.set_update_slot(Arc::new(on_update));
+        let created = ExportedRender::create(self.mpv.clone(), options, self.update_relay());
+        let render = match created {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_update_slot(Arc::new(|| {}));
+                return Err(e);
+            }
+        };
+        let shared = Arc::clone(render.shared());
+        *self.render.lock() = Some(RenderBackend::Exported(render));
+        tracing::debug!("mpv exported render context attached");
+        self.drain_pending_load();
+        drop(attaching);
+        // A frame published between the render thread coming up and the
+        // backend landing in the slot fired `on_update` into a window
+        // where `acquire_frame` still read an empty slot. Re-fire once
+        // now that the frame is acquirable — after every engine lock is
+        // released, per the callback contract.
+        if shared.has_published() {
+            (self.update_relay())();
+        }
+        Ok(())
+    }
+
+    /// Take the newest published frame from the exported backend, if one
+    /// is waiting. `Ok(None)` both when no frame has been published since
+    /// the last acquire and when no backend is attached (ordinary startup
+    /// state, mirroring [`render_gl`](Self::render_gl)'s no-op);
+    /// [`Error::RenderBackendMismatch`] when a different backend is
+    /// attached. Callable from any thread, including from inside the
+    /// exported backend's `on_update`.
+    #[cfg(all(
+        feature = "export",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub fn acquire_frame(&self) -> Result<Option<ExportedFrame>> {
+        // Clone the shared state out under a short slot lock; the take
+        // itself must not hold the render lock (an attach/detach could
+        // block behind an unrelated pool operation otherwise).
+        let shared = match self.render.lock().as_ref() {
+            Some(RenderBackend::Exported(r)) => Arc::clone(r.shared()),
+            Some(_) => return Err(Error::RenderBackendMismatch),
+            None => return Ok(None),
+        };
+        Ok(ExportedFrame::take_published(shared))
+    }
+
+    /// Resize the exported backend's frames: takes effect from the next
+    /// rendered frame (which is forced promptly, so a paused or ended
+    /// video re-renders at the new size instead of waiting for playback
+    /// to produce one — and if the shell happens to be holding every
+    /// pool buffer at that moment, the forced render re-arms as soon as
+    /// a frame handle is released, rather than being lost). Zero in
+    /// either dimension pauses rendering until a
+    /// real size arrives — map-before-layout states in a shell.
+    /// No-op `Ok` when nothing is attached;
+    /// [`Error::RenderBackendMismatch`] for a different backend.
+    /// Outstanding [`ExportedFrame`]s keep their original size.
+    #[cfg(all(
+        feature = "export",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub fn set_export_size(&self, width: u32, height: u32) -> Result<()> {
+        match self.render.lock().as_ref() {
+            Some(RenderBackend::Exported(r)) => {
+                r.shared().set_target_size(width, height);
+                Ok(())
+            }
+            Some(_) => Err(Error::RenderBackendMismatch),
+            None => Ok(()),
+        }
+    }
 }
 
-// No manual `Drop`: the render context co-owns the core through its own
-// `Arc<Mpv>`, so it is structurally freed before the core terminates —
-// field order can't break that anymore. If a GL target was attached,
-// prefer an explicit `detach_render` with the GL context current before
-// dropping; the implicit drop can't make that guarantee. (Wakeup- and
-// update-callback teardown is rsmpv's: closures are released safely even
-// against in-flight invocations, so mpv can never fire into freed memory.)
+// No resource-management `Drop`: the render context co-owns the core
+// through its own `Arc<Mpv>`, so it is structurally freed before the core
+// terminates — field order can't break that anymore. If a GL target was
+// attached, prefer an explicit `detach_render` with the GL context current
+// before dropping; the implicit drop can't make that guarantee. (Wakeup-
+// and update-callback teardown is rsmpv's: closures are released safely
+// even against in-flight invocations, so mpv can never fire into freed
+// memory.) The `export` Drop below only joins a parked render thread —
+// it manages no resource the field drops don't already cover.
+
+#[cfg(all(
+    feature = "export",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // A detach-from-`on_update` parks its render thread's handle
+        // (see `orphaned_render`); join it so the deferred GL/mpv
+        // teardown can't race process exit. When the engine itself dies
+        // on that thread, `join_orphaned_render` leaves the handle
+        // parked and it drops detached — same as before parking existed.
+        self.join_orphaned_render();
+    }
+}
