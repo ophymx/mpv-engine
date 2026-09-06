@@ -48,10 +48,11 @@
 //!
 //! | | Windows | Linux | macOS |
 //! |---|---|---|---|
-//! | kernel handles | `GetProcessHandleCount` | — | not implemented |
-//! | file descriptors | — | `/proc/self/fd` | not implemented |
+//! | kernel handles | `GetProcessHandleCount` | — | Mach port names |
+//! | file descriptors | — | `/proc/self/fd` | `PROC_PIDLISTFDS` |
 //! | GDI + USER objects | `GetGuiResources` | n/a | n/a |
-//! | memory | `PrivateUsage` | `VmRSS` | not implemented |
+//! | threads | — | `/proc/self/status` | `PROC_PIDTASKINFO` |
+//! | memory | `PrivateUsage` | `VmRSS` | `ri_phys_footprint` |
 //!
 //! On a platform with no sampler the leak scenarios report themselves
 //! unmeasured rather than passing vacuously — and even where there is
@@ -149,17 +150,31 @@ mod harness {
     /// thresholds are common; only [`sample`] is platform code.
     #[derive(Clone, Copy, Default, PartialEq, Eq)]
     struct Resources {
-        /// Open kernel handles (Windows only).
+        /// Kernel object references: open handles on Windows, Mach port
+        /// names on macOS — where every IOSurface, CGL context, Metal
+        /// object, thread and semaphore this process holds is a port
+        /// right, so a leaked pool buffer or GL context lands here even
+        /// when memory noise hides it.
         handles: Option<u64>,
-        /// Open file descriptors (Linux only).
+        /// Open file descriptors (Linux and macOS).
         fds: Option<u64>,
         /// GDI + USER objects (Windows only).
         gui: Option<u64>,
+        /// OS threads in the process (Linux and macOS). The export
+        /// backend owns a render thread per attach; a leaked one (the
+        /// class of bug the orphan-parking fix in `detach_render`
+        /// closed) is invisible to the handle and memory counters at
+        /// this scale but unmistakable here.
+        threads: Option<u64>,
         /// Bytes the process has committed for itself: `PrivateUsage`
-        /// on Windows, `VmRSS` on Linux. Deliberately *not* Windows'
-        /// working-set size — the OS trims and refills that on its own
-        /// schedule, so it drifts by megabytes for reasons that have
-        /// nothing to do with this process.
+        /// on Windows, `VmRSS` on Linux, `ri_phys_footprint` on macOS.
+        /// Deliberately *not* Windows' working-set size — the OS trims
+        /// and refills that on its own schedule, so it drifts by
+        /// megabytes for reasons that have nothing to do with this
+        /// process. On macOS, footprint rather than resident size
+        /// because the kernel attributes IOSurface memory — the pool's
+        /// entire currency — to footprint, while resident size can miss
+        /// it.
         rss: Option<u64>,
     }
 
@@ -175,6 +190,7 @@ mod harness {
                 handles: d(self.handles, earlier.handles),
                 fds: d(self.fds, earlier.fds),
                 gui: d(self.gui, earlier.gui),
+                threads: d(self.threads, earlier.threads),
                 rss: d(self.rss, earlier.rss),
             }
         }
@@ -189,6 +205,7 @@ mod harness {
         handles: Option<i64>,
         fds: Option<i64>,
         gui: Option<i64>,
+        threads: Option<i64>,
         rss: Option<i64>,
     }
 
@@ -203,6 +220,9 @@ mod harness {
             }
             if let Some(v) = self.gui {
                 parts.push(format!("gui {v:+}"));
+            }
+            if let Some(v) = self.threads {
+                parts.push(format!("threads {v:+}"));
             }
             if let Some(v) = self.rss {
                 parts.push(format!("mem {:+.1}MiB", v as f64 / (1024.0 * 1024.0)));
@@ -270,6 +290,9 @@ mod harness {
                 handles,
                 fds: None,
                 gui,
+                // No one-call thread count on Win32 (a Toolhelp snapshot
+                // walks every process); handles subsume threads there.
+                threads: None,
                 rss,
             }
         }
@@ -282,31 +305,191 @@ mod harness {
         let fds = std::fs::read_dir("/proc/self/fd")
             .ok()
             .map(|entries| entries.count() as u64);
-        let rss = std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|status| {
-                status.lines().find_map(|line| {
-                    let kb = line.strip_prefix("VmRSS:")?.split_whitespace().next()?;
-                    kb.parse::<u64>().ok().map(|kb| kb * 1024)
-                })
-            });
+        let status = std::fs::read_to_string("/proc/self/status").ok();
+        let field = |prefix: &str| {
+            status.as_deref()?.lines().find_map(|line| {
+                line.strip_prefix(prefix)?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+        };
+        let rss = field("VmRSS:").map(|kb| kb * 1024);
+        let threads = field("Threads:");
         Resources {
             handles: None,
             fds,
             gui: None,
+            threads,
             rss,
         }
     }
 
-    // macOS has neither `/proc` nor a one-call handle count; the honest
-    // equivalents are `proc_pidinfo(PROC_PIDLISTFDS)` for descriptors and
-    // `task_info(MACH_TASK_BASIC_INFO)` for resident size, both of which
-    // want libc/mach bindings this example does not carry. Until then the
-    // leak scenario reports itself unsupported here rather than pretending
-    // to measure.
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    /// The macOS sampler leans on two seams, declared directly in the
+    /// style of `src/export/macos.rs` rather than through a crate:
+    /// libproc (`proc_pidinfo` / `proc_pid_rusage` — what Activity
+    /// Monitor itself is built on) and Mach (`mach_port_names`). Both
+    /// live in libSystem, so nothing new is linked.
+    ///
+    /// Mach port names are the macOS analog of the Windows handle
+    /// count, and the sharpest counter for *this* crate's leak surface:
+    /// an IOSurface, a CGL context, a Metal object, a thread and a
+    /// semaphore are all port rights in this table, so a pool buffer or
+    /// hidden GL context that outlives its teardown shows up as +1 here
+    /// even when it is far below the memory noise floor. Memory itself
+    /// is `ri_phys_footprint` rather than resident size because the
+    /// kernel attributes IOSurface pages — the pool's entire currency —
+    /// to footprint, while resident size can miss purgeable/nonvolatile
+    /// surface memory entirely.
+    #[cfg(target_os = "macos")]
     fn sample() -> Resources {
-        Resources::default()
+        use std::ffi::{c_int, c_void};
+
+        const PROC_PIDLISTFDS: c_int = 1;
+        const PROC_PIDTASKINFO: c_int = 4;
+        /// `struct proc_fdinfo`: `i32` fd + `u32` fdtype.
+        const PROC_PIDLISTFD_SIZE: usize = 8;
+        const RUSAGE_INFO_V0: c_int = 0;
+
+        /// `struct proc_taskinfo` (sys/proc_info.h).
+        #[repr(C)]
+        struct ProcTaskInfo {
+            pti_virtual_size: u64,
+            pti_resident_size: u64,
+            pti_total_user: u64,
+            pti_total_system: u64,
+            pti_threads_user: u64,
+            pti_threads_system: u64,
+            pti_policy: i32,
+            pti_faults: i32,
+            pti_pageins: i32,
+            pti_cow_faults: i32,
+            pti_messages_sent: i32,
+            pti_messages_received: i32,
+            pti_syscalls_mach: i32,
+            pti_syscalls_unix: i32,
+            pti_csw: i32,
+            pti_threadnum: i32,
+            pti_numrunning: i32,
+            pti_priority: i32,
+        }
+
+        /// `struct rusage_info_v0` (sys/resource.h) — the v0 revision
+        /// already carries `ri_phys_footprint`, so the longer ones are
+        /// not needed.
+        #[repr(C)]
+        struct RusageInfoV0 {
+            ri_uuid: [u8; 16],
+            ri_user_time: u64,
+            ri_system_time: u64,
+            ri_pkg_idle_wkups: u64,
+            ri_interrupt_wkups: u64,
+            ri_pageins: u64,
+            ri_wired_size: u64,
+            ri_resident_size: u64,
+            ri_phys_footprint: u64,
+            ri_proc_start_abstime: u64,
+            ri_proc_exit_abstime: u64,
+        }
+
+        unsafe extern "C" {
+            fn proc_pidinfo(
+                pid: c_int,
+                flavor: c_int,
+                arg: u64,
+                buffer: *mut c_void,
+                buffersize: c_int,
+            ) -> c_int;
+            fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut RusageInfoV0) -> c_int;
+            /// `mach_task_self()` is a C macro over this global.
+            static mach_task_self_: u32;
+            fn mach_port_names(
+                task: u32,
+                names: *mut *mut u32,
+                names_count: *mut u32,
+                types: *mut *mut u32,
+                types_count: *mut u32,
+            ) -> i32;
+            fn vm_deallocate(task: u32, address: usize, size: usize) -> i32;
+        }
+
+        let pid = std::process::id() as c_int;
+
+        // Port-name table size. The two arrays come back vm_allocate'd
+        // in our own address space and are handed straight back — only
+        // the count matters.
+        let handles = unsafe {
+            let task = mach_task_self_;
+            let mut names: *mut u32 = std::ptr::null_mut();
+            let mut names_count: u32 = 0;
+            let mut types: *mut u32 = std::ptr::null_mut();
+            let mut types_count: u32 = 0;
+            (mach_port_names(
+                task,
+                &mut names,
+                &mut names_count,
+                &mut types,
+                &mut types_count,
+            ) == 0)
+                .then(|| {
+                    if !names.is_null() {
+                        vm_deallocate(task, names as usize, names_count as usize * 4);
+                    }
+                    if !types.is_null() {
+                        vm_deallocate(task, types as usize, types_count as usize * 4);
+                    }
+                    u64::from(names_count)
+                })
+        };
+
+        // Fd count: a null-buffer call returns the kernel's byte-size
+        // estimate (deliberately padded), so the real read follows with
+        // headroom — the count comes from the bytes actually written,
+        // which the padding does not inflate.
+        let fds = unsafe {
+            let hint = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
+            if hint <= 0 {
+                None
+            } else {
+                let capacity = hint as usize * 2 + 64 * PROC_PIDLISTFD_SIZE;
+                let mut buffer = vec![0u8; capacity];
+                let written = proc_pidinfo(
+                    pid,
+                    PROC_PIDLISTFDS,
+                    0,
+                    buffer.as_mut_ptr().cast(),
+                    capacity as c_int,
+                );
+                (written > 0).then(|| written as u64 / PROC_PIDLISTFD_SIZE as u64)
+            }
+        };
+
+        let threads = unsafe {
+            let mut info: ProcTaskInfo = std::mem::zeroed();
+            let size = size_of::<ProcTaskInfo>() as c_int;
+            let written = proc_pidinfo(
+                pid,
+                PROC_PIDTASKINFO,
+                0,
+                (&mut info as *mut ProcTaskInfo).cast(),
+                size,
+            );
+            (written == size).then_some(info.pti_threadnum as u64)
+        };
+
+        let rss = unsafe {
+            let mut info: RusageInfoV0 = std::mem::zeroed();
+            (proc_pid_rusage(pid, RUSAGE_INFO_V0, &mut info) == 0).then_some(info.ri_phys_footprint)
+        };
+
+        Resources {
+            handles,
+            fds,
+            gui: None,
+            threads,
+            rss,
+        }
     }
 
     // ---- gpu ---------------------------------------------------------
@@ -1031,6 +1214,15 @@ mod harness {
         steps.push(wait("first frame", 10.0, |h| Ok(h.panes[0].frames > 0)));
 
         steps.push(act("hold the whole pool", |h| {
+            // On macOS the last imported texture *is* a pool buffer —
+            // the Metal import parks the buffer in wgpu's drop callback
+            // and returns it only when the texture drops — while on
+            // Linux/Windows the import retires the buffer and the pool
+            // replaces it. Release it (and drain wgpu so the return
+            // actually lands) or one pool slot stays pinned and the
+            // hold below can never reach POOL_SIZE raw frames.
+            h.panes[0].last = None;
+            let _ = h.gfx.device.poll(wgpu::PollType::wait_indefinitely());
             h.panes[0].hold_target = POOL_SIZE;
             Ok(())
         }));
@@ -1288,6 +1480,12 @@ mod harness {
     const LEAK_BUDGET_HANDLES_TOTAL: i64 = 8;
     const LEAK_BUDGET_FDS_TOTAL: i64 = 8;
     const LEAK_BUDGET_GUI_TOTAL: i64 = 8;
+    /// Small but non-zero: every thread this crate spawns is joined by
+    /// an explicit teardown, so the correct per-run answer is zero —
+    /// the headroom is for pool threads the process shares (GCD workers
+    /// on macOS, mpv's own worker pool) parking and unparking between
+    /// samples.
+    const LEAK_BUDGET_THREADS_TOTAL: i64 = 4;
     const LEAK_BUDGET_RSS_MIB: f64 = 2.0;
     /// Per-cycle growth below which the trend is not worth a verdict —
     /// allocator noise lives here.
@@ -1583,6 +1781,7 @@ mod harness {
                     sensitivity.handles,
                     sensitivity.fds,
                     sensitivity.gui,
+                    sensitivity.threads,
                     sensitivity.rss,
                 ]
                 .iter()
@@ -1645,6 +1844,7 @@ mod harness {
                 check("handles", deltas.handles, LEAK_BUDGET_HANDLES_TOTAL);
                 check("fds", deltas.fds, LEAK_BUDGET_FDS_TOTAL);
                 check("gui objects", deltas.gui, LEAK_BUDGET_GUI_TOTAL);
+                check("threads", deltas.threads, LEAK_BUDGET_THREADS_TOTAL);
                 if let Some(rss) = deltas.rss {
                     let mib = rss as f64 / (1024.0 * 1024.0);
                     if mib > LEAK_BUDGET_RSS_MIB * n {
