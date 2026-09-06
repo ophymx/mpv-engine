@@ -59,6 +59,26 @@ use rsmpv::render::{OpenGlFbo, OwnedRenderContext};
 use crate::error::{Error, Result};
 use platform::SurfaceBuffer;
 
+/// GL enum values shared by the backends' hidden-context FBO plumbing.
+/// The three platforms load GL differently (link-time on macOS,
+/// proc-address on Linux/Windows), so their `extern` declarations stay
+/// local — but these constants are the same numbers everywhere and live
+/// here once. Platform-specific enums (e.g. macOS's `GL_TEXTURE_RECTANGLE`)
+/// stay in their own module.
+// Each platform imports only the subset it needs; the rest are unused on
+// that build, which is expected for a shared enum table.
+#[allow(dead_code)]
+mod gl_consts {
+    pub(crate) const GL_TEXTURE_2D: u32 = 0x0DE1;
+    pub(crate) const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
+    pub(crate) const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
+    pub(crate) const GL_NEAREST: i32 = 0x2600;
+    pub(crate) const GL_RGBA8: u32 = 0x8058;
+    pub(crate) const GL_FRAMEBUFFER: u32 = 0x8D40;
+    pub(crate) const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+    pub(crate) const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+}
+
 /// Attach-time configuration for
 /// [`Engine::attach_exported_render`](crate::Engine::attach_exported_render).
 ///
@@ -746,6 +766,54 @@ fn retire_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
     // retired-queue wake.
     shared.rearm_dropped_render();
     shared.notify();
+}
+
+/// Copy `h` rows of `w` BGRA pixels from a mapped source with row stride
+/// `src_stride` bytes into a freshly allocated, tightly packed `w*h*4`
+/// buffer (row 0 first). The one row-packing loop every backend's
+/// `copy_pixels` shares — only the mapping bracket around it differs.
+///
+/// # Safety
+/// `base` must point to at least `src_stride * h` readable bytes, with
+/// `src_stride >= w * 4`.
+unsafe fn pack_bgra_rows(base: *const u8, src_stride: usize, w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * 4];
+    for row in 0..h {
+        // SAFETY: caller guarantees `base` covers `src_stride * h` bytes;
+        // `out` is exactly `w * h * 4` and each write is `w * 4` at
+        // `row * w * 4`, in bounds.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                base.add(row * src_stride),
+                out.as_mut_ptr().add(row * w * 4),
+                w * 4,
+            );
+        }
+    }
+    out
+}
+
+/// The `wgpu::TextureDescriptor` every `into_wgpu_texture` hands to
+/// `create_texture_from_hal` — identical on all three backends
+/// (`Bgra8Unorm`, `TEXTURE_BINDING | COPY_SRC`, 2D, one mip/sample). The
+/// per-platform parts (initial `TextureUses`, how the hal texture is
+/// built, return-vs-retire) stay in the platform modules.
+#[cfg(feature = "wgpu")]
+pub(super) fn exported_texture_desc(width: u32, height: u32) -> wgpu::TextureDescriptor<'static> {
+    wgpu::TextureDescriptor {
+        label: Some("mpv-exported-frame"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    }
 }
 
 impl std::fmt::Debug for ExportedFrame {

@@ -200,14 +200,11 @@ unsafe extern "system" {
 
 // ---- WGL plus the GL 1.1 core opengl32 exports ----
 
-const GL_TEXTURE_2D: u32 = 0x0DE1;
-const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
-const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
-const GL_NEAREST: i32 = 0x2600;
-const GL_RGBA8: u32 = 0x8058;
-const GL_FRAMEBUFFER: u32 = 0x8D40;
-const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
-const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+// Texture/FBO GL enums shared with the other backends.
+use super::gl_consts::{
+    GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE, GL_NEAREST, GL_RGBA8,
+    GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
+};
 
 /// The FBO color format reported to mpv (`OpenGlFbo::internal_format`).
 /// A hint only — the real storage layout is fixed by the D3D11 texture's
@@ -1156,9 +1153,8 @@ impl SurfaceBuffer {
     /// lock-failure behavior.
     pub(crate) fn copy_pixels(&self) -> Vec<u8> {
         let (w, h) = (self.width as usize, self.height as usize);
-        let mut out = vec![0u8; w * h * 4];
         if w == 0 || h == 0 {
-            return out;
+            return vec![0u8; w * h * 4];
         }
         let desc = Texture2dDesc {
             width: self.width,
@@ -1184,7 +1180,7 @@ impl SurfaceBuffer {
             )
         };
         if hr < 0 || staging.is_null() {
-            return out;
+            return vec![0u8; w * h * 4];
         }
         let ctx = self.d3d.context.lock();
         unsafe {
@@ -1195,23 +1191,25 @@ impl SurfaceBuffer {
                 row_pitch: 0,
                 depth_pitch: 0,
             };
-            if (v.map)(*ctx, staging, 0, D3D11_MAP_READ, 0, &mut mapped) >= 0
+            let out = if (v.map)(*ctx, staging, 0, D3D11_MAP_READ, 0, &mut mapped) >= 0
                 && !mapped.data.is_null()
             {
-                let base = mapped.data.cast::<u8>();
-                let pitch = mapped.row_pitch as usize;
-                for row in 0..h {
-                    std::ptr::copy_nonoverlapping(
-                        base.add(row * pitch),
-                        out.as_mut_ptr().add(row * w * 4),
-                        w * 4,
-                    );
-                }
+                // SAFETY: the staging copy is mapped; `data` covers
+                // `row_pitch * h` readable bytes with `row_pitch >= w * 4`.
+                let out = super::pack_bgra_rows(
+                    mapped.data.cast::<u8>(),
+                    mapped.row_pitch as usize,
+                    w,
+                    h,
+                );
                 (v.unmap)(*ctx, staging, 0);
-            }
+                out
+            } else {
+                vec![0u8; w * h * 4]
+            };
             com_release(staging);
+            out
         }
-        out
     }
 }
 

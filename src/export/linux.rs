@@ -142,14 +142,12 @@ type PfnEglDestroyImage = unsafe extern "C" fn(EGLDisplay, EGLImage) -> EGLBoole
 // them — libGL or libGLESv2 — depends on which context the ladder in
 // `create_context` lands on) ----
 
-const GL_TEXTURE_2D: u32 = 0x0DE1;
-const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
-const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
-const GL_NEAREST: i32 = 0x2600;
-const GL_RGBA8: u32 = 0x8058;
-const GL_FRAMEBUFFER: u32 = 0x8D40;
-const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
-const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+// Texture/FBO GL enums shared with the other backends.
+use super::gl_consts::{
+    GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE, GL_NEAREST, GL_RGBA8,
+    GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
+};
+
 const GL_NO_ERROR: u32 = 0;
 
 /// The FBO color format reported to mpv (`OpenGlFbo::internal_format`).
@@ -677,10 +675,9 @@ impl SurfaceBuffer {
     pub(crate) fn copy_pixels(&self) -> Vec<u8> {
         let (w, h) = (self.width as usize, self.height as usize);
         let stride = self.stride as usize;
-        let mut out = vec![0u8; w * h * 4];
         let len = stride * h;
         if len == 0 {
-            return out;
+            return vec![0u8; w * h * 4];
         }
         unsafe {
             let base = libc::mmap(
@@ -692,23 +689,18 @@ impl SurfaceBuffer {
                 0,
             );
             if base == libc::MAP_FAILED {
-                return out;
+                return vec![0u8; w * h * 4];
             }
             // Best-effort sync bracket: exporters without the ioctl are
             // coherent-mapping ones, so failure is ignorable.
             dma_buf_sync(&self.fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
-            let base = base.cast::<u8>();
-            for row in 0..h {
-                std::ptr::copy_nonoverlapping(
-                    base.add(row * stride),
-                    out.as_mut_ptr().add(row * w * 4),
-                    w * 4,
-                );
-            }
+            // SAFETY: `base` maps `len == stride * h` readable bytes with
+            // `stride >= w * 4`.
+            let out = super::pack_bgra_rows(base.cast::<u8>(), stride, w, h);
             dma_buf_sync(&self.fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
-            libc::munmap(base.cast::<c_void>(), len);
+            libc::munmap(base, len);
+            out
         }
-        out
     }
 }
 

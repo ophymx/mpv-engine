@@ -116,20 +116,7 @@ impl ExportedFrame {
             .expect("buffer present until drop/presented");
         super::retire_buffer(&self.shared, buffer);
 
-        let desc = wgpu::TextureDescriptor {
-            label: Some("mpv-exported-frame"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bgra8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        };
+        let desc = super::exported_texture_desc(width, height);
         // SAFETY: hal texture and descriptor agree, and the content is
         // fully initialized. The empty initial state is deliberate: it
         // maps to `D3D12_RESOURCE_STATE_COMMON`, which is the state a

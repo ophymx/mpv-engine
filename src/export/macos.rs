@@ -83,14 +83,13 @@ const CGL_PROFILE_GL4_CORE: i32 = 0x4100;
 const CGL_PROFILE_GL3_CORE: i32 = 0x3200;
 const CGL_PROFILE_LEGACY: i32 = 0x1000;
 
+// FBO/framebuffer GL enums shared with the other backends.
+use super::gl_consts::{GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE, GL_RGBA8};
+
 const GL_TEXTURE_RECTANGLE: u32 = 0x84F5;
 const GL_RGBA: u32 = 0x1908;
-const GL_RGBA8: u32 = 0x8058;
 const GL_BGRA: u32 = 0x80E1;
 const GL_UNSIGNED_INT_8_8_8_8_REV: u32 = 0x8367;
-const GL_FRAMEBUFFER: u32 = 0x8D40;
-const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
-const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
 
 /// The FBO color format reported to mpv (`OpenGlFbo::internal_format`).
 pub(crate) const FBO_INTERNAL_FORMAT: i32 = GL_RGBA8 as i32;
@@ -357,25 +356,22 @@ impl SurfaceBuffer {
     /// (row 0 = top). Any thread.
     pub(crate) fn copy_pixels(&self) -> Vec<u8> {
         let (w, h) = (self.width as usize, self.height as usize);
-        let mut out = vec![0u8; w * h * 4];
         unsafe {
             if IOSurfaceLock(self.surface, IOSURFACE_LOCK_READ_ONLY, std::ptr::null_mut()) != 0 {
-                return out;
+                return vec![0u8; w * h * 4];
             }
             let base = IOSurfaceGetBaseAddress(self.surface) as *const u8;
             let stride = IOSurfaceGetBytesPerRow(self.surface);
-            if !base.is_null() {
-                for row in 0..h {
-                    std::ptr::copy_nonoverlapping(
-                        base.add(row * stride),
-                        out.as_mut_ptr().add(row * w * 4),
-                        w * 4,
-                    );
-                }
-            }
+            // SAFETY: the surface is locked; when non-null, `base` covers
+            // `stride * h` readable bytes with `stride >= w * 4`.
+            let out = if base.is_null() {
+                vec![0u8; w * h * 4]
+            } else {
+                super::pack_bgra_rows(base, stride, w, h)
+            };
             IOSurfaceUnlock(self.surface, IOSURFACE_LOCK_READ_ONLY, std::ptr::null_mut());
+            out
         }
-        out
     }
 }
 
