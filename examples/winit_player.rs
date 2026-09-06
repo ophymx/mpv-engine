@@ -28,6 +28,10 @@ mod player {
         device: wgpu::Device,
         queue: wgpu::Queue,
         config: wgpu::SurfaceConfiguration,
+        // The most recently imported frame, retained so a bare repaint
+        // (resize, occlusion, a wakeup with no new video) can re-present
+        // it — a paused or ended clip never publishes a replacement.
+        last: Option<wgpu::Texture>,
     }
 
     struct App {
@@ -92,6 +96,7 @@ mod player {
             device,
             queue,
             config,
+            last: None,
         }
     }
 
@@ -109,32 +114,39 @@ mod player {
         }
 
         fn redraw(&mut self) {
-            let Some(gfx) = &self.gfx else { return };
-            // Take the surface *before* consuming a frame: acquiring
-            // first would discard the newest frame on every bail-out
-            // below, and a paused or ended video never publishes a
-            // replacement — leaving the surface here keeps the frame
-            // published (newest-wins) for the retry.
+            let engine = &self.engine;
+            let Some(gfx) = self.gfx.as_mut() else { return };
+            // Consume the newest published frame if one is waiting and
+            // keep it as `last`. Do this *before* touching the surface so
+            // a wakeup that carries no new video (mpv pokes us for many
+            // reasons) doesn't acquire a swapchain image at all.
+            match engine.acquire_frame() {
+                Ok(Some(frame)) => match frame.into_wgpu_texture(&gfx.device) {
+                    Ok(texture) => gfx.last = Some(texture),
+                    Err(e) => eprintln!("frame import failed: {e}"),
+                },
+                Ok(None) => {} // nothing new — we'll re-present `last`
+                Err(_) => return,
+            }
+            // Nothing to show until the first frame has landed.
+            let Some(texture) = gfx.last.as_ref() else {
+                return;
+            };
+            // Acquire a swapchain image *only* now that we have something
+            // to draw: an image acquired and then dropped without
+            // `present` is never returned to the presentation engine, and
+            // on Vulkan a few of those starve the swapchain — every later
+            // `get_current_texture` times out and the window goes black.
             use wgpu::CurrentSurfaceTexture as Cst;
             let target = match gfx.surface.get_current_texture() {
                 Cst::Success(target) | Cst::Suboptimal(target) => target,
                 Cst::Timeout | Cst::Occluded => return,
                 Cst::Outdated | Cst::Lost | Cst::Validation => {
-                    // Reconfigure and retry — the unconsumed frame is
-                    // still waiting, so a redraw completes even when
-                    // mpv will never publish another one.
+                    // Reconfigure and retry — `last` is retained, so the
+                    // redraw completes even when mpv will never publish
+                    // another frame.
                     gfx.surface.configure(&gfx.device, &gfx.config);
                     gfx.window.request_redraw();
-                    return;
-                }
-            };
-            let Ok(Some(frame)) = self.engine.acquire_frame() else {
-                return; // nothing new published since the last acquire
-            };
-            let texture = match frame.into_wgpu_texture(&gfx.device) {
-                Ok(texture) => texture,
-                Err(e) => {
-                    eprintln!("frame import failed: {e}");
                     return;
                 }
             };
