@@ -44,6 +44,8 @@ use self::windows as platform;
 mod wgpu_linux;
 #[cfg(all(feature = "wgpu", target_os = "macos"))]
 mod wgpu_macos;
+#[cfg(all(feature = "wgpu", target_os = "windows"))]
+mod wgpu_windows;
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -731,7 +733,7 @@ fn return_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
 /// parks in `retired` until the render thread deletes its GL names and
 /// releases our own reference on the memory — the importer holds its
 /// own.
-#[cfg(all(feature = "wgpu", target_os = "linux"))]
+#[cfg(all(feature = "wgpu", any(target_os = "linux", target_os = "windows")))]
 fn retire_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
     {
         let mut state = shared.state.lock();

@@ -1,9 +1,12 @@
 //! wgpu import tests: exported frames wrapped as `wgpu::Texture`s on a
-//! real device — Metal on macOS, Vulkan on Linux — verified by reading
-//! the texture back through wgpu itself. Skips like the other suites
-//! when mpv, ffmpeg, a GL context, or a suitable wgpu adapter is
-//! unavailable.
-#![cfg(all(feature = "wgpu", any(target_os = "macos", target_os = "linux")))]
+//! real device — Metal on macOS, Vulkan on Linux, DX12 on Windows —
+//! verified by reading the texture back through wgpu itself. Skips like
+//! the other suites when mpv, ffmpeg, a GL context, or a suitable wgpu
+//! adapter is unavailable.
+#![cfg(all(
+    feature = "wgpu",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 
 mod common;
 
@@ -19,6 +22,10 @@ fn wgpu_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     #[cfg(target_os = "linux")]
     {
         descriptor.backends = wgpu::Backends::VULKAN;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        descriptor.backends = wgpu::Backends::DX12;
     }
     let instance = wgpu::Instance::new(descriptor);
     let adapter = match pollster::block_on(instance.request_adapter(&Default::default())) {
@@ -141,7 +148,7 @@ fn imported_texture_matches_frame_pixels() {
 
     let via_wgpu = read_back(&device, &queue, &texture);
     // Identical bytes: zero-copy means the texture *is* the exported
-    // buffer (IOSurface / DMA-BUF).
+    // buffer (IOSurface / DMA-BUF / shared D3D11 texture).
     assert_pixels_match(
         &via_wgpu,
         &expected,
@@ -157,8 +164,10 @@ fn imported_texture_matches_frame_pixels() {
         "top pixel should be red in BGRA"
     );
 
-    // Dropping the texture must release the pool buffer (the hal drop
-    // callback) without deadlock, and detach must still tear down clean.
+    // Dropping the texture must release the pool buffer (returned
+    // through the hal drop callback on macOS, already retired
+    // elsewhere) without deadlock, and detach must still tear down
+    // clean.
     drop(texture);
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     engine.detach_render();
@@ -177,8 +186,9 @@ fn texture_outlives_frame_and_detach() {
     let texture = frame.into_wgpu_texture(&device).expect("wgpu import");
     // The frame is consumed and the engine detached — the texture (and
     // the memory it holds: retained IOSurface on macOS, imported dmabuf
-    // reference on Linux) must remain fully readable: wgpu owns the
-    // backing now, not the pool or the render thread.
+    // reference on Linux, opened shared resource on Windows) must remain
+    // fully readable: wgpu owns the backing now, not the pool or the
+    // render thread.
     engine.detach_render();
     drop(engine);
     let via_wgpu = read_back(&device, &queue, &texture);
