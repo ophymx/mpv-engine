@@ -249,10 +249,11 @@ struct PoolState {
     /// pool-size cap counts all of them. Buffers in `retired` have
     /// already left the count.
     live: usize,
-    /// Buffers permanently out of the pool (the Linux and Windows wgpu
-    /// imports consume them — see [`retire_buffer`]), parked here for
-    /// the render thread to delete their GL names on its next wake.
-    /// Always empty on macOS.
+    /// Buffers permanently out of the pool (the Linux wgpu import
+    /// consumes them — see [`retire_buffer`]), parked here for the
+    /// render thread to delete their GL names on its next wake. Usually
+    /// empty on macOS and Windows, whose imports return the buffer
+    /// instead; a resize still retires wrong-size buffers everywhere.
     retired: Vec<SurfaceBuffer>,
 }
 

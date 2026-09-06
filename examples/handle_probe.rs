@@ -72,6 +72,23 @@ mod probe {
     const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
     const INVALID_HANDLE_VALUE: *mut c_void = usize::MAX as *mut c_void;
 
+    const GR_GDIOBJECTS: u32 = 0;
+    const GR_USEROBJECTS: u32 = 1;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetGuiResources(process: *mut c_void, flags: u32) -> u32;
+    }
+
+    /// GDI + USER objects: where a leaked window, DC or GL context shows
+    /// up, as opposed to the kernel handles `handles()` counts.
+    fn gui() -> u32 {
+        unsafe {
+            let process = GetCurrentProcess();
+            GetGuiResources(process, GR_GDIOBJECTS) + GetGuiResources(process, GR_USEROBJECTS)
+        }
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentProcess() -> *mut c_void;
@@ -167,7 +184,7 @@ mod probe {
         let engine = match mode {
             "headless" => Engine::headless().property("ao", "null").build(),
             #[cfg(feature = "export")]
-            "export" | "resize" => Engine::video().property("ao", "null").build(),
+            "export" | "resize" | "attach" => Engine::video().property("ao", "null").build(),
             #[cfg(feature = "wgpu")]
             "import" => Engine::video().property("ao", "null").build(),
             other => {
@@ -185,9 +202,18 @@ mod probe {
         }
 
         println!("mode={mode} cycles={cycles}");
-        println!("{:>6} {:>9} {:>9}", "cycle", "handles", "threads");
+        println!(
+            "{:>6} {:>9} {:>9} {:>7}",
+            "cycle", "handles", "threads", "gui"
+        );
         // Warm-up outside the measurement: the first load pulls in
         // demuxers, codecs and their threads.
+        #[cfg(feature = "export")]
+        if mode == "attach" {
+            engine
+                .attach_exported_render(mpv_engine::ExportOptions::new(320, 240), || {})
+                .expect("attach");
+        }
         for _ in 0..3 {
             let _ = engine.load(&clip);
             until(10.0, || !engine.is_idle());
@@ -195,8 +221,8 @@ mod probe {
             until(10.0, || engine.is_idle());
         }
         std::thread::sleep(Duration::from_millis(500));
-        let (h0, t0) = (handles(), threads());
-        println!("{:>6} {h0:>9} {t0:>9}   <- baseline", 0);
+        let (h0, t0, g0) = (handles(), threads(), gui());
+        println!("{:>6} {h0:>9} {t0:>9} {g0:>7}   <- baseline", 0);
 
         // Only built for the "import" mode; a device with no surface is
         // all the frame import needs.
@@ -221,6 +247,16 @@ mod probe {
             }
             // Per-mode extra work, matching what the harness's load-churn
             // cycle does beyond a bare load/stop.
+            #[cfg(feature = "export")]
+            if mode == "attach" {
+                // The GL context, its hidden window and DC, the D3D11
+                // device and the render thread are all built and torn
+                // down here — where a leaked USER/GDI object would land.
+                engine.detach_render();
+                engine
+                    .attach_exported_render(mpv_engine::ExportOptions::new(320, 240), || {})
+                    .expect("re-attach");
+            }
             #[cfg(feature = "export")]
             if mode == "resize" {
                 for (w, h) in [(480u32, 270u32), (320, 240)] {
@@ -271,12 +307,15 @@ mod probe {
                 // sample reads low for reasons that have nothing to do
                 // with a leak.
                 std::thread::sleep(Duration::from_millis(800));
-                let (h, t) = (handles(), threads());
+                let (h, t, g) = (handles(), threads(), gui());
                 println!(
-                    "{i:>6} {h:>9} {t:>9}   ({:+} handles, {:+} threads, {:.2} handles/cycle)",
+                    "{i:>6} {h:>9} {t:>9} {g:>7}   ({:+} handles, {:+} threads, {:+} gui; \
+                     {:.2} handles/cycle, {:.2} gui/cycle)",
                     h as i64 - h0 as i64,
                     t as i64 - t0 as i64,
+                    g as i64 - g0 as i64,
                     (h as f64 - h0 as f64) / i as f64,
+                    (g as f64 - g0 as f64) / i as f64,
                 );
             }
         }

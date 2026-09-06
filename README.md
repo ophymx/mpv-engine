@@ -99,9 +99,10 @@ Owned here today:
   on macOS (IOSurface wrap, pool buffer returned via the hal drop
   callback), Vulkan on Linux (wgpu-hal's own dmabuf import; the
   device opts in with `Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF`), or
-  DX12 on Windows (`ID3D12Device::OpenSharedHandle`); on the latter two
-  the pool buffer is retired outright, since wgpu's imported reference
-  owns the frame's memory from there and neither hal path offers the
+  DX12 on Windows (`ID3D12Device::OpenSharedHandle`, pool buffer
+  returned when D3D12 destroys the opened resource); on Linux the pool
+  buffer is retired outright instead, since wgpu's imported reference
+  owns the frame's memory from there and that hal path offers no
   drop-callback seam — with the frame's memory kept
   out of mpv's hands until wgpu's own GPU-completion tracking releases
   the texture: no manual hold-until-completion discipline on any
