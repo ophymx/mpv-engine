@@ -616,6 +616,13 @@ mod harness {
         /// worth *recording* rather than asserting, like which way mpv
         /// reacted to a teardown.
         notes: Vec<String>,
+        /// The window size `relayout` last applied. A `Resized` event is
+        /// supposed to drive relayout, but Wayland compositors coalesce or
+        /// drop those — a window can reach a new size with no event ever
+        /// delivered, stranding the panes at the old export size. The
+        /// runner reconciles against this each tick so a missed event
+        /// can't wedge a resize scenario (see `reconcile_layout`).
+        layout_size: (u32, u32),
     }
 
     impl Harness {
@@ -694,7 +701,8 @@ mod harness {
         }
 
         /// Re-apply the current window size to the surface and to every
-        /// pane's export size. Called on every `Resized`.
+        /// pane's export size. Called on every `Resized`, and by
+        /// [`reconcile_layout`] when an event was missed.
         fn relayout(&mut self) {
             let (w, h) = self.window_size();
             self.gfx.config.width = w;
@@ -707,6 +715,19 @@ mod harness {
                 pane.rect = rect;
                 // Zero would pause rendering; `layout` already floors at 1.
                 let _ = pane.engine.set_export_size(rect.w, rect.h);
+            }
+            self.layout_size = (w, h);
+        }
+
+        /// Relayout if the live window size has drifted from what
+        /// `relayout` last applied — the safety net for `Resized` events a
+        /// Wayland compositor coalesced or never sent. A no-op (no
+        /// reconfigure, no `set_export_size`) whenever they already agree,
+        /// so it is cheap to call every tick.
+        fn reconcile_layout(&mut self) {
+            if self.window_size() != self.layout_size {
+                self.relayout();
+                self.window.request_redraw();
             }
         }
 
@@ -1796,6 +1817,10 @@ mod harness {
 
                 let deltas = sample().since(before);
                 let n = iterations as f64;
+                // Whether the memory *trend* (below) judged this a leak.
+                // `None` until enough samples exist to trend, in which case
+                // the RSS check falls back to the flat per-cycle budget.
+                let mut rss_is_leak: Option<bool> = None;
                 // Linear or flattening? Compare the two halves' rates.
                 let trail = trail.borrow();
                 if let (Some(first), Some(last)) = (trail.first(), trail.last())
@@ -1822,6 +1847,10 @@ mod harness {
                     } else {
                         "WARN steady — suspect a leak"
                     };
+                    // "WARN steady" is the only verdict that means leak;
+                    // the others are warm-up/cache the flat budget must not
+                    // punish. This is what the RSS check defers to.
+                    rss_is_leak = Some(verdict.starts_with("WARN"));
                     h.note(format!(
                         "mem/cycle {early:.2}MiB early vs {late:.2}MiB late: {verdict}"
                     ));
@@ -1849,10 +1878,15 @@ mod harness {
                 check("threads", deltas.threads, LEAK_BUDGET_THREADS_TOTAL);
                 if let Some(rss) = deltas.rss {
                     let mib = rss as f64 / (1024.0 * 1024.0);
-                    if mib > LEAK_BUDGET_RSS_MIB * n {
+                    // Memory legitimately carries one-time warm-up (ICD,
+                    // codec tables, allocator arenas), so the early-vs-late
+                    // trend is the authority — a flat total-average budget
+                    // over-reports on warm-up-heavy runs. The budget is only
+                    // the fallback when there were too few samples to trend.
+                    let over = rss_is_leak.unwrap_or(mib > LEAK_BUDGET_RSS_MIB * n);
+                    if over {
                         leaks.push(format!(
-                            "rss grew by {mib:.1}MiB ({:.2}MiB/cycle, budget \
-                             {LEAK_BUDGET_RSS_MIB}MiB/cycle)",
+                            "rss grew by {mib:.1}MiB ({:.2}MiB/cycle) on a non-flattening trend",
                             mib / n
                         ));
                     }
@@ -1961,6 +1995,9 @@ mod harness {
             if self.scenario >= self.scenarios.len() {
                 return true;
             }
+            // Catch any resize the `Resized` event didn't deliver before
+            // the step's `poll` reads the window/pane sizes.
+            h.reconcile_layout();
             if self.step == 0 && !self.entered {
                 self.started = Instant::now();
                 h.notes.clear();
@@ -2090,6 +2127,9 @@ mod harness {
                 proxy: self.proxy.clone(),
                 playback_error: None,
                 notes: Vec::new(),
+                // (0, 0) never matches a real window, so the first tick
+                // reconciles the layout even if no `Resized` ever lands.
+                layout_size: (0, 0),
             };
             if matches!(self.mode, Mode::Interactive) {
                 harness.set_panes(1).expect("attach");
