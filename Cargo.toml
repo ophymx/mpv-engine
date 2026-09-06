@@ -103,3 +103,10 @@ winit = "0.30"
 [[example]]
 name = "winit_player"
 required-features = ["wgpu"]
+
+# Real-window lifecycle harness (resize / fullscreen / transport /
+# teardown / back-to-back / multi-engine). Needs a display and a GPU, so
+# it is a manual gate rather than a `tests/` binary.
+[[example]]
+name = "harness"
+required-features = ["wgpu"]

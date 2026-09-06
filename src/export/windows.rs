@@ -89,6 +89,24 @@ const IID_IDXGI_FACTORY1: Guid = Guid {
     data3: 0x4dba,
     data4: [0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87],
 };
+#[cfg(feature = "wgpu")]
+/// `IID_IUnknown` — the one interface [`ReleaseKeeper`] answers to.
+const IID_IUNKNOWN: Guid = Guid {
+    data1: 0x0000_0000,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+#[cfg(feature = "wgpu")]
+/// Private-data slot this module parks its [`ReleaseKeeper`] in. A
+/// GUID of our own: private data is keyed by GUID, so a unique one
+/// cannot collide with wgpu's or the driver's own slots.
+const GUID_EXPORT_RELEASE_KEEPER: Guid = Guid {
+    data1: 0x7b1c_4f2a,
+    data2: 0x9d63,
+    data3: 0x4c58,
+    data4: [0xa1, 0x0e, 0x6f, 0x2d, 0x83, 0xb4, 0x71, 0x95],
+};
 /// `IID_ID3D11Multithread`.
 const IID_ID3D11_MULTITHREAD: Guid = Guid {
     data1: 0x9b7e_4e00,
@@ -379,6 +397,21 @@ struct ID3D11DeviceContextVtbl {
     flush: unsafe extern "system" fn(*mut c_void),
 }
 
+#[cfg(feature = "wgpu")]
+/// `ID3D12Object`'s prefix: `IUnknown`, then `GetPrivateData` (3),
+/// `SetPrivateData` (4), `SetPrivateDataInterface` (5). Every
+/// `ID3D12Resource` is an `ID3D12Object`, so slot 5 is reachable
+/// through any resource pointer.
+#[repr(C)]
+struct ID3D12ObjectVtbl {
+    _unknown: IUnknownVtbl,
+    _get_private_data: *const c_void,
+    _set_private_data: *const c_void,
+    /// 5.
+    set_private_data_interface:
+        unsafe extern "system" fn(*mut c_void, *const Guid, *mut c_void) -> Hresult,
+}
+
 #[repr(C)]
 struct ID3D11MultithreadVtbl {
     _unknown: IUnknownVtbl,
@@ -455,6 +488,139 @@ unsafe extern "system" {
 
 fn hresult_error(what: &str, hr: Hresult) -> Error {
     Error::ExportSetup(format!("{what}: HRESULT {:#010x}", hr as u32))
+}
+
+// ---- Completion seam for cross-API imports ----
+
+#[cfg(feature = "wgpu")]
+/// A minimal `IUnknown` whose only job is to run a callback when its
+/// last reference goes away.
+///
+/// Parked in an `ID3D12Resource`'s private data, it becomes the drop
+/// callback D3D12 does not otherwise offer: the resource releases its
+/// private-data interfaces when it is destroyed, and the consumer
+/// (wgpu) destroys the resource only once the GPU has finished every
+/// submission that used it. That is precisely the moment the pool may
+/// recycle the buffer again — the same guarantee wgpu-hal's Metal
+/// backend hands us through `DropCallback`, which the DX12 backend has
+/// no equivalent of.
+///
+/// Layout is load-bearing: `vtable` must be the first field, because a
+/// COM interface pointer *is* a pointer to its vtable pointer.
+#[repr(C)]
+struct ReleaseKeeper {
+    vtable: *const IUnknownVtbl,
+    refcount: std::sync::atomic::AtomicU32,
+    /// Taken and run by the final `Release`. `None` once fired, or when
+    /// the attach failed and the caller reclaimed responsibility.
+    on_release: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[cfg(feature = "wgpu")]
+/// SAFETY: `this` is a live `ReleaseKeeper` — the only pointer ever
+/// handed to D3D12 under [`GUID_EXPORT_RELEASE_KEEPER`], kept alive by
+/// its own refcount.
+unsafe fn keeper<'a>(this: *mut c_void) -> &'a ReleaseKeeper {
+    unsafe { &*this.cast::<ReleaseKeeper>() }
+}
+
+#[cfg(feature = "wgpu")]
+unsafe extern "system" fn keeper_query_interface(
+    this: *mut c_void,
+    iid: *const Guid,
+    out: *mut *mut c_void,
+) -> Hresult {
+    const E_POINTER: Hresult = -0x7FFF_BFFD; // 0x80004003
+    const E_NOINTERFACE: Hresult = -0x7FFF_BFFE; // 0x80004002
+    if out.is_null() {
+        return E_POINTER;
+    }
+    // Only `IUnknown`: nothing is ever meant to *use* this object, only
+    // to hold and eventually release it.
+    let matches = !iid.is_null()
+        && unsafe {
+            let iid = &*iid;
+            iid.data1 == IID_IUNKNOWN.data1
+                && iid.data2 == IID_IUNKNOWN.data2
+                && iid.data3 == IID_IUNKNOWN.data3
+                && iid.data4 == IID_IUNKNOWN.data4
+        };
+    if matches {
+        unsafe {
+            keeper_add_ref(this);
+            *out = this;
+        }
+        return 0;
+    }
+    unsafe { *out = std::ptr::null_mut() };
+    E_NOINTERFACE
+}
+
+#[cfg(feature = "wgpu")]
+unsafe extern "system" fn keeper_add_ref(this: *mut c_void) -> u32 {
+    unsafe { keeper(this) }
+        .refcount
+        .fetch_add(1, Ordering::Relaxed)
+        + 1
+}
+
+#[cfg(feature = "wgpu")]
+unsafe extern "system" fn keeper_release(this: *mut c_void) -> u32 {
+    let left = unsafe { keeper(this) }
+        .refcount
+        .fetch_sub(1, Ordering::AcqRel)
+        - 1;
+    if left == 0 {
+        // Reassemble the box and fire. Any thread may land here — this
+        // is whichever thread wgpu destroys the resource on — so the
+        // callback must be `Send` and must not assume the render thread.
+        let mut owned = unsafe { Box::from_raw(this.cast::<ReleaseKeeper>()) };
+        if let Some(on_release) = owned.on_release.take() {
+            on_release();
+        }
+    }
+    left
+}
+
+#[cfg(feature = "wgpu")]
+static KEEPER_VTABLE: IUnknownVtbl = IUnknownVtbl {
+    query_interface: keeper_query_interface,
+    add_ref: keeper_add_ref,
+    release: keeper_release,
+};
+
+#[cfg(feature = "wgpu")]
+/// Arrange for `on_release` to run when `resource` is destroyed.
+///
+/// `resource` must be an `ID3D12Resource` (or any `ID3D12Object`) whose
+/// only reference is about to be handed to a consumer. Returns whether
+/// the callback was attached; on `false` it has *not* run and never
+/// will, so the caller keeps responsibility for whatever it owns.
+pub(crate) fn on_resource_release(
+    resource: *mut c_void,
+    on_release: Box<dyn FnOnce() + Send>,
+) -> bool {
+    let raw = Box::into_raw(Box::new(ReleaseKeeper {
+        vtable: &KEEPER_VTABLE,
+        // One reference: ours, released below once D3D12 has taken its own.
+        refcount: std::sync::atomic::AtomicU32::new(1),
+        on_release: Some(on_release),
+    }));
+    let hr = unsafe {
+        (vtbl::<ID3D12ObjectVtbl>(resource).set_private_data_interface)(
+            resource,
+            &GUID_EXPORT_RELEASE_KEEPER,
+            raw.cast::<c_void>(),
+        )
+    };
+    if hr < 0 {
+        // Nothing took a reference, so our release below would fire the
+        // callback immediately — exactly what the caller must not have,
+        // since it is about to fall back to handling this itself.
+        unsafe { (*raw).on_release = None };
+    }
+    unsafe { com_release(raw.cast::<c_void>()) };
+    hr >= 0
 }
 
 // ---- The D3D11 device shared by the context and every buffer ----
