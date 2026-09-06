@@ -165,9 +165,8 @@ fn imported_texture_matches_frame_pixels() {
     );
 
     // Dropping the texture must release the pool buffer (returned
-    // through the hal drop callback on macOS, already retired
-    // elsewhere) without deadlock, and detach must still tear down
-    // clean.
+    // through a hal drop callback on macOS and Linux, ReleaseKeeper on
+    // Windows) without deadlock, and detach must still tear down clean.
     drop(texture);
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     engine.detach_render();
@@ -193,4 +192,113 @@ fn texture_outlives_frame_and_detach() {
     drop(engine);
     let via_wgpu = read_back(&device, &queue, &texture);
     assert_pixels_match(&via_wgpu, &expected, has_alpha, "readback after detach");
+}
+
+/// 2 seconds of 64x64 moving video (ffmpeg `testsrc`, rawvideo in NUT),
+/// so successive frames differ. None when ffmpeg is absent.
+fn generate_moving_clip(target: &std::path::Path) -> Option<()> {
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=15",
+            "-t",
+            "2",
+            "-c:v",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    matches!(status, Ok(s) if s.success()).then_some(())
+}
+
+/// Continuously importing from a looping source must recycle pool buffers
+/// *and keep them correct*. The Linux import returns each buffer to the
+/// pool when wgpu is done with the texture (the same reuse macOS/Windows
+/// do), so importing far more frames than the pool holds cycles every
+/// buffer many times. An aliasing bug — mpv rendering into a buffer a
+/// consumer still reads — would surface here two ways: a wgpu readback
+/// that no longer matches the frame's own CPU copy, or content that never
+/// changes (a stuck buffer). Regression guard for the reuse path
+/// (github.com/ophymx/mpv-engine/issues/4).
+#[test]
+fn continuous_import_recycles_buffers_and_stays_correct() {
+    use std::collections::HashSet;
+    use std::hash::{Hash, Hasher};
+    use std::time::{Duration, Instant};
+
+    let Some((device, queue)) = wgpu_device() else {
+        return;
+    };
+    let Some(engine) = common::video_engine() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clip = dir.path().join("moving.nut");
+    if generate_moving_clip(&clip).is_none() {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    if engine
+        .attach_exported_render(mpv_engine::ExportOptions::new(64, 64), move || {
+            let _ = tx.send(());
+        })
+        .is_err()
+    {
+        eprintln!("skipping: exported render unavailable");
+        return;
+    }
+    engine.set_property("loop-file", "inf").expect("loop-file");
+    engine
+        .load_when_ready(clip.to_str().expect("utf-8 path"))
+        .expect("load");
+
+    // Far more imports than the pool size, so buffers must be recycled.
+    const WANT: usize = 24;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut imported = 0usize;
+    let mut fingerprints = HashSet::new();
+    while imported < WANT && Instant::now() < deadline {
+        let _ = rx.recv_timeout(Duration::from_millis(100));
+        let Some(frame) = engine.acquire_frame().expect("acquire") else {
+            continue;
+        };
+        let cpu = frame.copy_pixels();
+        // Skip the pre-load clear render (all black); it is not content.
+        if !cpu.chunks_exact(4).any(|px| px[0] | px[1] | px[2] != 0) {
+            continue;
+        }
+        let has_alpha = frame_has_alpha(&frame);
+        let texture = frame.into_wgpu_texture(&device).expect("wgpu import");
+        let via_wgpu = read_back(&device, &queue, &texture);
+        assert_pixels_match(
+            &via_wgpu,
+            &cpu,
+            has_alpha,
+            "recycled-buffer readback differs from the frame's own pixels",
+        );
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        cpu.hash(&mut h);
+        fingerprints.insert(h.finish());
+        drop(texture);
+        // Let wgpu finish and fire the drop callback, returning the buffer
+        // to the pool so the next render recycles it.
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        imported += 1;
+    }
+    assert!(
+        imported >= WANT,
+        "only imported {imported}/{WANT} frames from a looping source"
+    );
+    assert!(
+        fingerprints.len() >= 2,
+        "every recycled buffer read back identical content — a stuck or aliased buffer"
+    );
+    engine.detach_render();
 }

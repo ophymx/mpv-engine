@@ -38,6 +38,7 @@ wgpu = [
     "export",
     "dep:wgpu",
     "dep:wgpu-hal",
+    "dep:ash",
     "dep:objc2",
     "dep:objc2-metal",
     "dep:objc2-io-surface",
@@ -61,6 +62,14 @@ tracing = "0.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 wgpu = { version = "30", default-features = false, features = ["vulkan"], optional = true }
 wgpu-hal = { version = "30", default-features = false, features = ["vulkan"], optional = true }
+# The Linux wgpu import hand-rolls the dmabuf → VkImage import and wraps
+# it via wgpu-hal's public `texture_from_raw` (with a DropCallback), so a
+# consumed frame's pool buffer is *reused* rather than retired and
+# reallocated per frame. No new crate enters the tree: wgpu-hal already
+# depends on ash, and this must resolve to the *same* ash so the
+# `vk::Image` types match — `30`'s wgpu-hal is on ash 0.38. Version-locked
+# to wgpu like the rest of this feature (see the `wgpu` feature note).
+ash = { version = "0.38", optional = true }
 
 # The objc2 trio exists only to wrap an IOSurface in an MTLTexture on the
 # consumer's device — the same generation of bindings wgpu-hal's Metal

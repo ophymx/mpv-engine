@@ -809,8 +809,10 @@ impl Drop for ExportedFrame {
 }
 
 /// Return an in-use buffer to the pool: the one bookkeeping path shared
-/// by [`ExportedFrame`]'s drop and (on macOS) the wgpu import's drop
-/// callback. Linux and Windows retire instead — see [`retire_buffer`].
+/// by [`ExportedFrame`]'s drop and the wgpu imports' drop callbacks
+/// (macOS via Metal's `DropCallback`, Linux via the hand-rolled
+/// `texture_from_raw` callback, Windows via `ReleaseKeeper`). Windows
+/// still falls back to [`retire_buffer`] when it can't arm that callback.
 /// After teardown the buffer just idles in `free` until the shared state
 /// drops with it (GL names died with the context; the backing memory is
 /// released by `SurfaceBuffer`'s own drop).
@@ -823,18 +825,16 @@ fn return_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
     shared.rearm_dropped_render();
 }
 
-/// Permanently retire an in-use buffer from the pool — the Linux and
-/// Windows wgpu imports' counterpart to [`return_buffer`]: the buffer's
-/// memory now backs a wgpu texture that wgpu releases on its own
-/// completion schedule, so mpv must never render into that memory again
-/// (the same aliasing hazard the macOS drop callback prevents, solved by
-/// consumption instead of reuse — neither wgpu-hal's dmabuf import nor
-/// its D3D12 `texture_from_raw` offers that callback seam). Shrinking
-/// `live` lets the render thread allocate a replacement; the buffer
-/// parks in `retired` until the render thread deletes its GL names and
-/// releases our own reference on the memory — the importer holds its
-/// own.
-#[cfg(all(feature = "wgpu", any(target_os = "linux", target_os = "windows")))]
+/// Permanently retire an in-use buffer from the pool — the Windows wgpu
+/// import's fallback counterpart to [`return_buffer`], used only when it
+/// can't arm the `ReleaseKeeper` completion callback: the buffer's memory
+/// backs a wgpu texture that wgpu releases on its own schedule, so mpv
+/// must never render into that memory again. Shrinking `live` lets the
+/// render thread allocate a replacement; the buffer parks in `retired`
+/// until the render thread deletes its GL names and releases our own
+/// reference on the memory — the importer holds its own. (macOS and,
+/// since issue #4's POC, Linux always reuse via a drop callback instead.)
+#[cfg(all(feature = "wgpu", target_os = "windows"))]
 fn retire_buffer(shared: &ExportShared, buffer: SurfaceBuffer) {
     {
         let mut state = shared.state.lock();
