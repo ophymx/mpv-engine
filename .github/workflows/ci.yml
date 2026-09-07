@@ -43,6 +43,31 @@ jobs:
       # degrades to a bare `rustc-link-lib` when pkg-config finds nothing.
       - run: cargo check --locked --all-targets
 
+  # Compile-check every platform × feature combination. The default `test`
+  # job builds none of the `export`/`wgpu` code (it's off by default and
+  # platform-gated) — this is where `macos.rs`, `windows.rs`, and the wgpu
+  # import backends actually get type-checked and linted, on their own OS.
+  # clippy is check-based (no link step), so — like the msrv job — it needs
+  # no libmpv: rsmpv-sys degrades to a bare `rustc-link-lib` when
+  # pkg-config finds nothing.
+  platforms:
+    name: clippy ${{ matrix.os }} / ${{ matrix.features }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # `wgpu` implies `export`; `export` alone is the combo a
+        # Metal/Vulkan/D3D consumer who doesn't want wgpu would build.
+        features: [export, wgpu]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets --features ${{ matrix.features }} -- -D warnings
+
   lint:
     name: fmt + clippy + doc
     runs-on: ubuntu-latest
@@ -55,5 +80,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # Doc the feature surface too — the export/wgpu rustdoc (and its
+      # intra-doc links) is otherwise never checked.
+      - run: cargo doc --locked --no-deps --features wgpu
         env:
           RUSTDOCFLAGS: -D warnings

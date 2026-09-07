@@ -81,10 +81,7 @@
 
 mod engine;
 mod error;
-#[cfg(all(
-    feature = "export",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
+#[cfg(export_backend)]
 mod export;
 mod render;
 
@@ -93,14 +90,8 @@ pub use engine::{
     PropertyValue,
 };
 pub use error::{Error, Result};
-#[cfg(all(
-    feature = "export",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
+#[cfg(export_backend)]
 pub use export::{ExportOptions, ExportedFrame};
-#[cfg(all(
-    feature = "wgpu",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
+#[cfg(wgpu_backend)]
 pub use export::{REQUIRED_WGPU_FEATURES, WGPU_BACKEND};
 pub use render::{GlRenderOptions, ProcAddressFn, RenderKind};

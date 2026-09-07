@@ -11,7 +11,7 @@
 //! pipelines, no GL anywhere in this file — mpv letterboxes into the
 //! frame itself, so the copy is the entire compositor.
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(wgpu_backend)]
 mod player {
     use std::sync::Arc;
 
@@ -257,12 +257,12 @@ mod player {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(wgpu_backend)]
 fn main() {
     player::run();
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(wgpu_backend))]
 fn main() {
     eprintln!("the exported-frame backend needs macOS, Linux or Windows");
 }

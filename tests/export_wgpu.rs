@@ -3,10 +3,7 @@
 //! verified by reading the texture back through wgpu itself. Skips like
 //! the other suites when mpv, ffmpeg, a GL context, or a suitable wgpu
 //! adapter is unavailable.
-#![cfg(all(
-    feature = "wgpu",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
+#![cfg(wgpu_backend)]
 
 mod common;
 
