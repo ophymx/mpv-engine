@@ -65,10 +65,7 @@
 //! assertable through `duration`), into a tempdir deleted on exit.
 //! Without ffmpeg the harness skips rather than fails.
 
-#[cfg(all(
-    feature = "wgpu",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
+#[cfg(wgpu_backend)]
 mod harness {
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
@@ -2383,18 +2380,12 @@ mod harness {
     }
 }
 
-#[cfg(all(
-    feature = "wgpu",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
+#[cfg(wgpu_backend)]
 fn main() {
     std::process::exit(harness::run());
 }
 
-#[cfg(not(all(
-    feature = "wgpu",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-)))]
+#[cfg(not(wgpu_backend))]
 fn main() {
     eprintln!("the harness needs the `wgpu` feature on macOS, Linux or Windows");
 }

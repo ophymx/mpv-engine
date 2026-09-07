@@ -26,10 +26,7 @@ pub enum Error {
     /// (SSH, bare CI, missing render/video group), no OpenGL ICD or no
     /// `WGL_NV_DX_interop2` on Windows — treat it like a missing display
     /// and fall back to another backend or skip.
-    #[cfg(all(
-        feature = "export",
-        any(target_os = "macos", target_os = "linux", target_os = "windows")
-    ))]
+    #[cfg(export_backend)]
     #[error("exported render setup: {0}")]
     ExportSetup(String),
     /// Importing an exported frame into a wgpu device failed (`wgpu`
@@ -41,10 +38,7 @@ pub enum Error {
     /// different GPU than the engine's hidden context (Windows), or the
     /// driver refused the IOSurface wrap / DMA-BUF import / shared-handle
     /// open.
-    #[cfg(all(
-        feature = "wgpu",
-        any(target_os = "macos", target_os = "linux", target_os = "windows")
-    ))]
+    #[cfg(wgpu_backend)]
     #[error("wgpu import: {0}")]
     WgpuImport(String),
     /// A call that needs a live render context ran before any attach.
