@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "mpv-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ash",
  "libc",
