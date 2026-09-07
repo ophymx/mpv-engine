@@ -51,7 +51,7 @@ libc = "0.2"
 # clean-room bindings; the only copyleft in a consumer's tree is libmpv
 # itself — see LICENSING.md. `render` pulls in the safe render.h wrapper
 # the render seam is built on.
-rsmpv = { version = "0.2", features = ["render"] }
+rsmpv = { version = "0.2.1", features = ["render"] }
 parking_lot = "0.12"
 thiserror = "2"
 tracing = "0.1"

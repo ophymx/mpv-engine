@@ -1374,9 +1374,9 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "rsmpv"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccbd32637324c2e35c00e0e4268f2ba16e0fa337b8e58749787ce1a6daee827d"
+checksum = "c43d845c72fe35aba06906f130c10e96665295b7fc948b8246c851c6f5811fec"
 dependencies = [
  "rsmpv-sys",
 ]

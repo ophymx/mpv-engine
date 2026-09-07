@@ -308,13 +308,20 @@ pub(crate) struct GlContext {
     display: DisplayHandle,
     gbm: GbmHandle,
     _drm: OwnedFd,
+    // A second, independent open of the same render node, handed to mpv
+    // for its VAAPI GL interop (`vaGetDisplayDRM`). Kept separate from
+    // `_drm` on purpose: `_drm` is owned by Mesa's GBM/EGL (iris), and a
+    // VADisplay (iHD) created on that *same* fd fails to decode/export
+    // (VA_STATUS_ERROR_OPERATION_FAILED) — the vaapi-copy path works only
+    // because libavcodec opens its own fresh fd. This is ours.
+    va_drm: OwnedFd,
     egl_create_image: PfnEglCreateImage,
     egl_destroy_image: PfnEglDestroyImage,
     fns: GlFns,
 }
 
 impl GlContext {
-    fn on_node(drm: OwnedFd) -> Result<Self> {
+    fn on_node(drm: OwnedFd, va_drm: OwnedFd) -> Result<Self> {
         let gbm = unsafe { gbm_create_device(drm.as_raw_fd()) };
         if gbm.is_null() {
             return Err(Error::ExportSetup(
@@ -379,6 +386,7 @@ impl GlContext {
             display,
             gbm,
             _drm: drm,
+            va_drm,
             egl_create_image,
             egl_destroy_image,
             fns,
@@ -406,7 +414,13 @@ impl ExportBackend for GlContext {
             let Some(drm) = open_node(minor) else {
                 continue;
             };
-            match Self::on_node(drm) {
+            // A second independent open of the same node for mpv's VAAPI
+            // display (see `GlContext::va_drm`); skip the node if it can't
+            // be opened twice.
+            let Some(va_drm) = open_node(minor) else {
+                continue;
+            };
+            match Self::on_node(drm, va_drm) {
                 Ok(gl) => return Ok(gl),
                 Err(e) => {
                     tracing::debug!("export: render node renderD{minor} unusable: {e}");
@@ -458,6 +472,13 @@ impl ExportBackend for GlContext {
 
     fn proc_address(name: &str) -> *mut c_void {
         gl_proc_address(name)
+    }
+
+    fn drm_render_fd(&self) -> Option<i32> {
+        // Our dedicated second open of the render node (not the GBM/iris
+        // one) — handed to mpv so its VAAPI GL interop can `vaGetDisplayDRM`
+        // and decode zero-copy instead of falling back to `vaapi-copy`.
+        Some(self.va_drm.as_raw_fd())
     }
 }
 
