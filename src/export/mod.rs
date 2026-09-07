@@ -126,6 +126,16 @@ pub(crate) trait ExportBackend: Sized {
 
     /// Resolve a GL entry point for mpv's loader.
     fn proc_address(name: &str) -> *mut c_void;
+
+    /// A DRM render node fd to hand mpv (`MPV_RENDER_PARAM_DRM_DISPLAY_V2`)
+    /// so its VAAPI GL interop can open a VA display on this surfaceless
+    /// context — enabling zero-copy `hwdec=vaapi` instead of the
+    /// `vaapi-copy` readback fallback. `None` (the default) means the
+    /// platform has no such fd / doesn't need it (macOS, Windows); Linux
+    /// returns its DRM render-node fd.
+    fn drm_render_fd(&self) -> Option<i32> {
+        None
+    }
 }
 
 /// A "born exportable" color buffer: renderable as a GL FBO color
@@ -419,8 +429,17 @@ fn render_thread(
     // every later call — context and renderer live and die on this one
     // thread, with the renderer dropped first (declaration order below is
     // irrelevant; both drops happen before `render_thread` returns, ctx
-    // explicitly before `gl`).
-    let mut ctx = match unsafe { OwnedRenderContext::new_opengl(core, true, proc_address) } {
+    // explicitly before `gl`). On Linux we also hand mpv the DRM render
+    // node fd so its VAAPI interop can open a VA display (zero-copy
+    // hwdec=vaapi); the fd stays open for the context's life (owned by
+    // `gl`, dropped after `ctx`).
+    let created = match gl.drm_render_fd() {
+        Some(render_fd) => unsafe {
+            OwnedRenderContext::new_opengl_drm(core, true, proc_address, render_fd)
+        },
+        None => unsafe { OwnedRenderContext::new_opengl(core, true, proc_address) },
+    };
+    let mut ctx = match created {
         Ok(ctx) => ctx,
         Err(e) => {
             let _ = init_tx.send(Err(e.into()));
